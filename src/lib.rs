@@ -395,6 +395,20 @@ impl<K: Key, E> JumpArray<K, E> {
         self.entries.get(i).map(|(k, v)| (k, v))
     }
 
+    /// 按下标区间 `[from, to)` 直接迭代（**不做定位**；越界自动截断）。
+    ///
+    /// 给了 [`RangeIter::span`] 之后想复用这段区间时用它——省掉一次定位。
+    pub fn span_iter(&self, (from, to): (usize, usize)) -> RangeIter<'_, K, E> {
+        let n = self.entries.len();
+        let from = from.min(n);
+        let to = to.clamp(from, n);
+        RangeIter {
+            slice: &self.entries[from..to],
+            start: from,
+            end: to,
+        }
+    }
+
     /// 创建属于本实例的游标（顺序访问用）。
     pub fn cursor(&self) -> Cursor {
         Cursor {

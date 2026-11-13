@@ -391,4 +391,123 @@ fn main() {
     print_row::<JumpTuned<16>, _>(n, clustered);
     print_row::<JumpTuned<32>, _>(n, clustered);
     print_row::<JumpTuned<64>, _>(n, clustered);
+
+    // ④ 拆解窗口成本：定位（pos）/ 迭代（iter）/ 合计（full），ns/窗口。
+    println!("\n## 窗口拆解 n = {n}（ns/窗口：pos=只定位 iter=只迭代 full=合计）");
+    window_split(n, "稀疏均匀", sparse);
+    window_split(n, "聚簇    ", clustered);
+}
+
+/// 把"定位"和"迭代"分开计时：两边都按同样的 64 元素窗口序列。
+fn window_split(
+    n: usize,
+    label: &str,
+    key: impl Fn(usize) -> i64 + Copy,
+) {
+    let wins = (n / 64).max(1);
+    let mut j = JumpArray::<i64, u32>::new();
+    let mut v: Vec<(i64, u32)> = Vec::with_capacity(n);
+    for i in 0..n {
+        let k = key(i);
+        j.insert(k, i as u32).ok();
+        v.push((k, i as u32));
+    }
+    j.rebuild();
+
+    // Jump：先预取 spans（用于 iter-only），再分别计时。
+    let mut cur = j.cursor();
+    let mut spans = Vec::with_capacity(wins);
+    for w in 0..wins {
+        let lo = key(w * 64);
+        let hi = key(((w + 1) * 64).min(n - 1));
+        spans.push(j.range_from(&mut cur, lo, hi).span());
+    }
+
+    let pos_j = bench(|| {
+        let mut cur = j.cursor();
+        let mut acc = 0usize;
+        for w in 0..wins {
+            let lo = key(w * 64);
+            let hi = key(((w + 1) * 64).min(n - 1));
+            let (a, b) = j.range_from(&mut cur, lo, hi).span();
+            acc = acc.wrapping_add(a ^ b);
+        }
+        black_box(acc);
+    }) * 1e9
+        / wins as f64;
+    let iter_j = bench(|| {
+        let mut acc = 0i64;
+        for &sp in &spans {
+            for (k, _) in j.span_iter(sp) {
+                acc = acc.wrapping_add(*k);
+            }
+        }
+        black_box(acc);
+    }) * 1e9
+        / wins as f64;
+    let full_j = bench(|| {
+        let mut cur = j.cursor();
+        let mut acc = 0i64;
+        for w in 0..wins {
+            let lo = key(w * 64);
+            let hi = key(((w + 1) * 64).min(n - 1));
+            for (k, _) in j.range_from(&mut cur, lo, hi) {
+                acc = acc.wrapping_add(*k);
+            }
+        }
+        black_box(acc);
+    }) * 1e9
+        / wins as f64;
+
+    // Vec：同样拆两半。
+    let mut vspans = Vec::with_capacity(wins);
+    for w in 0..wins {
+        let lo = key(w * 64);
+        let hi = key(((w + 1) * 64).min(n - 1));
+        vspans.push((
+            v.partition_point(|(x, _)| *x < lo),
+            v.partition_point(|(x, _)| *x <= hi),
+        ));
+    }
+    let pos_v = bench(|| {
+        let mut acc = 0usize;
+        for w in 0..wins {
+            let lo = key(w * 64);
+            let hi = key(((w + 1) * 64).min(n - 1));
+            let a = v.partition_point(|(x, _)| *x < lo);
+            let b = v.partition_point(|(x, _)| *x <= hi);
+            acc = acc.wrapping_add(a ^ b);
+        }
+        black_box(acc);
+    }) * 1e9
+        / wins as f64;
+    let iter_v = bench(|| {
+        let mut acc = 0i64;
+        for &(a, b) in &vspans {
+            for (k, _) in &v[a..b] {
+                acc = acc.wrapping_add(*k);
+            }
+        }
+        black_box(acc);
+    }) * 1e9
+        / wins as f64;
+    let full_v = bench(|| {
+        let mut acc = 0i64;
+        for w in 0..wins {
+            let lo = key(w * 64);
+            let hi = key(((w + 1) * 64).min(n - 1));
+            let a = v.partition_point(|(x, _)| *x < lo);
+            let b = v.partition_point(|(x, _)| *x <= hi);
+            for (k, _) in &v[a..b] {
+                acc = acc.wrapping_add(*k);
+            }
+        }
+        black_box(acc);
+    }) * 1e9
+        / wins as f64;
+
+    println!(
+        "  {label} | jump pos {:6.1} iter {:6.1} full {:6.1} | vec pos {:6.1} iter {:6.1} full {:6.1}",
+        pos_j, iter_j, full_j, pos_v, iter_v, full_v
+    );
 }
