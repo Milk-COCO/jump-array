@@ -127,7 +127,12 @@ impl<K: Key, E> JumpArray<K, E> {
     }
 
     /// 重建块表（批量写完之后调一次，恢复 O(1) 查询）。
+    ///
+    /// 幂等：索引已经是干净的（`!dirty`）时直接返回，不重复 O(n) 扫描。
     pub fn rebuild(&mut self) {
+        if !self.dirty {
+            return;
+        }
         self.blocks.clear();
         if self.entries.is_empty() {
             self.base = 0.0;
@@ -424,5 +429,28 @@ mod tests {
         let (blocks, len, _) = a.stats();
         assert!(blocks <= 40_000, "块表 {blocks} 应 ≈ 元素数 {len}");
         assert_eq!(a.find_le(&500_000.5).map(|(k, _)| *k), Some(500_000.0));
+    }
+
+    /// `rebuild` 幂等：干净时重复调用不改任何状态（尤其不重复扫描）。
+    #[test]
+    fn rebuild_is_idempotent() {
+        let mut a = JumpArray::<i64, u8>::new();
+        for i in 0..1000 {
+            a.insert(i * 3, 0).unwrap();
+        }
+        a.rebuild();
+        let before = a.stats();
+        a.rebuild();
+        a.rebuild();
+        assert_eq!(a.stats(), before, "重复 rebuild 不应改变块表");
+        // 写入后转脏，再 rebuild 应恢复。
+        a.insert(-1, 1).unwrap();
+        a.rebuild();
+        let (blocks, len, _) = a.stats();
+        assert_eq!(len, 1001);
+        assert!(blocks > 0);
+        assert_eq!(a.find_le(&-1).map(|(k, _)| *k), Some(-1), "新首键可取到");
+        assert_eq!(a.find_le(&0).map(|(k, _)| *k), Some(0));
+        assert!(a.find_le(&-2).is_none(), "base 已换到新首键");
     }
 }
