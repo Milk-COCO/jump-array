@@ -254,6 +254,301 @@ fn bench(mut f: impl FnMut()) -> f64 {
     times[times.len() / 2]
 }
 
+/// 从 `(probe, 时间)` 样本里剔除 probe 偏差 >20% 的轮次，取中位数。
+fn median_filtered(samples: &[(f64, f64)]) -> f64 {
+    let best_probe = samples.iter().map(|(p, _)| *p).fold(f64::MAX, f64::min);
+    let mut times: Vec<f64> = samples
+        .iter()
+        .filter(|(p, _)| *p <= best_probe * 1.2)
+        .map(|(_, e)| *e)
+        .collect();
+    if times.is_empty() {
+        times = samples.iter().map(|(_, e)| *e).collect();
+    }
+    times.sort_by(f64::total_cmp);
+    times[times.len() / 2]
+}
+
+/// 成对交替测量：同一轮里先测 A 再测 B，消除"先后两段"之间的机器状态漂移。
+fn paired<A: Store, B: Store, FA, FB>(a: &A, b: &B, mut fa: FA, mut fb: FB) -> (f64, f64)
+where
+    FA: FnMut(&A),
+    FB: FnMut(&B),
+{
+    let mut ta: Vec<(f64, f64)> = Vec::with_capacity(ROUNDS);
+    let mut tb: Vec<(f64, f64)> = Vec::with_capacity(ROUNDS);
+    for r in 0..ROUNDS {
+        // 奇偶轮交换先后，抵消"先测者占优/吃亏"。
+        if r % 2 == 0 {
+            let p = cpu_probe_ms();
+            let t = Instant::now();
+            fa(a);
+            ta.push((p, t.elapsed().as_secs_f64()));
+            let p = cpu_probe_ms();
+            let t = Instant::now();
+            fb(b);
+            tb.push((p, t.elapsed().as_secs_f64()));
+        } else {
+            let p = cpu_probe_ms();
+            let t = Instant::now();
+            fb(b);
+            tb.push((p, t.elapsed().as_secs_f64()));
+            let p = cpu_probe_ms();
+            let t = Instant::now();
+            fa(a);
+            ta.push((p, t.elapsed().as_secs_f64()));
+        }
+    }
+    (median_filtered(&ta), median_filtered(&tb))
+}
+
+/// 建好表、备好查询序列的 store。
+struct Prep<S: Store> {
+    store: S,
+    wins: usize,
+    qs: Vec<i64>,
+}
+
+fn prep<S: Store, F: Fn(usize) -> i64 + Copy>(n: usize, key: F, win: usize) -> Prep<S> {
+    let mut store = S::new();
+    for i in 0..n {
+        store.insert(key(i), i as u32).ok();
+    }
+    store.finalize();
+    let probes = (n * 2).clamp(10_000, 500_000);
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let qs: Vec<i64> = (0..probes)
+        .map(|_| (rng.below((n as u64) * 997 + 2000)) as i64)
+        .collect();
+    Prep {
+        store,
+        wins: (n / win).max(1),
+        qs,
+    }
+}
+
+/// 读指标成对测量：返回 `(A 的, B 的)`，各为 `(rand, seq, iter, win, wincur)`（ns）。
+fn paired_read<A: Store, B: Store, F: Fn(usize) -> i64 + Copy>(
+    n: usize,
+    key: F,
+    win: usize,
+) -> ((f64, f64, f64, f64, f64), (f64, f64, f64, f64, f64)) {
+    let a = prep::<A, _>(n, key, win);
+    let b = prep::<B, _>(n, key, win);
+    let probes = a.qs.len() as f64;
+    let wins = a.wins as f64;
+
+    let (rand_a, rand_b) = paired(
+        &a.store,
+        &b.store,
+        |s| {
+            let mut acc = 0i64;
+            for q in &a.qs {
+                if let Some((k, _)) = s.find_le(q) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+            black_box(acc);
+        },
+        |s| {
+            let mut acc = 0i64;
+            for q in &b.qs {
+                if let Some((k, _)) = s.find_le(q) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+            black_box(acc);
+        },
+    );
+
+    let (seq_a, seq_b) = paired(
+        &a.store,
+        &b.store,
+        |s| {
+            let mut acc = 0i64;
+            for i in 0..n {
+                if let Some((k, _)) = s.find_le(&key(i)) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+            black_box(acc);
+        },
+        |s| {
+            let mut acc = 0i64;
+            for i in 0..n {
+                if let Some((k, _)) = s.find_le(&key(i)) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+            black_box(acc);
+        },
+    );
+
+    let (iter_a, iter_b) = paired(
+        &a.store,
+        &b.store,
+        |s| {
+            let mut acc = 0u64;
+            for (k, v) in s.iter_all() {
+                acc = acc.wrapping_add(*k as u64).wrapping_add(*v as u64);
+            }
+            black_box(acc);
+        },
+        |s| {
+            let mut acc = 0u64;
+            for (k, v) in s.iter_all() {
+                acc = acc.wrapping_add(*k as u64).wrapping_add(*v as u64);
+            }
+            black_box(acc);
+        },
+    );
+
+    let (win_a, win_b) = paired(
+        &a.store,
+        &b.store,
+        |s| {
+            let mut acc = 0i64;
+            for w in 0..a.wins {
+                let lo = key(w * win);
+                let hi = key(((w + 1) * win).min(n - 1));
+                for (k, _) in s.range(lo, hi) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+            black_box(acc);
+        },
+        |s| {
+            let mut acc = 0i64;
+            for w in 0..b.wins {
+                let lo = key(w * win);
+                let hi = key(((w + 1) * win).min(n - 1));
+                for (k, _) in s.range(lo, hi) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+            black_box(acc);
+        },
+    );
+
+    let (wincur_a, wincur_b) = paired(
+        &a.store,
+        &b.store,
+        |s| {
+            black_box(s.window_sum(&key, a.wins, n, win));
+        },
+        |s| {
+            black_box(s.window_sum(&key, b.wins, n, win));
+        },
+    );
+
+    (
+        (
+            rand_a * 1e9 / probes,
+            seq_a * 1e9 / n as f64,
+            iter_a * 1e9 / n as f64,
+            win_a * 1e9 / wins,
+            wincur_a * 1e9 / wins,
+        ),
+        (
+            rand_b * 1e9 / probes,
+            seq_b * 1e9 / n as f64,
+            iter_b * 1e9 / n as f64,
+            win_b * 1e9 / wins,
+            wincur_b * 1e9 / wins,
+        ),
+    )
+}
+
+/// 建表/编辑指标（单档，构建在计时之外）。
+fn edit_metrics<S: Store, F: Fn(usize) -> i64 + Copy>(
+    n: usize,
+    key: F,
+) -> (f64, f64, f64, f64) {
+    let mut mem_mb = 0.0;
+    let build_ms = bench(|| {
+        let mut s = S::new();
+        for i in 0..n {
+            s.insert(key(i), i as u32).ok();
+        }
+        s.finalize();
+        mem_mb = s.mem_bytes() as f64 / 1e6;
+        black_box(s.mem_bytes());
+    }) * 1e3;
+
+    let add = (n / 10).clamp(100, 2000);
+    let mut rng = Rng(0xdead_beef_1234_5678);
+    let inserts: Vec<i64> = (0..add)
+        .map(|_| (rng.below((n as u64) * 997 * 2)) as i64)
+        .collect();
+    let mut best_ins = f64::MAX;
+    for _ in 0..ROUNDS {
+        let mut s = S::new();
+        for i in 0..n {
+            s.insert(key(i), i as u32).ok();
+        }
+        s.finalize();
+        let t = Instant::now();
+        for (j, k) in inserts.iter().enumerate() {
+            s.insert(*k, j as u32).ok();
+        }
+        black_box(s.mem_bytes());
+        best_ins = best_ins.min(t.elapsed().as_secs_f64());
+    }
+    let removes = inserts.clone();
+    let mut best_del = f64::MAX;
+    for _ in 0..ROUNDS {
+        let mut s = S::new();
+        for i in 0..n {
+            s.insert(key(i), i as u32).ok();
+        }
+        let t = Instant::now();
+        for k in &removes {
+            s.remove(k);
+        }
+        black_box(s.mem_bytes());
+        best_del = best_del.min(t.elapsed().as_secs_f64());
+    }
+    (
+        build_ms,
+        mem_mb,
+        best_ins * 1e9 / add as f64,
+        best_del * 1e9 / removes.len() as f64,
+    )
+}
+
+/// 成对打印两档（同轮交替测量）。
+fn print_pair<A: Store, B: Store, F: Fn(usize) -> i64 + Copy>(n: usize, key: F, win: usize) {
+    let (ra, rb) = paired_read::<A, B, _>(n, key, win);
+    let (build_a, mem_a, ins_a, del_a) = edit_metrics::<A, _>(n, key);
+    let (build_b, mem_b, ins_b, del_b) = edit_metrics::<B, _>(n, key);
+    println!(
+        "  {:<10} build {:>8.2}ms | mem {:>5.2}MB | find_le rand {:>6.1}ns seq {:>5.1}ns | iter {:>5.2}ns/e | win {:>6.1}ns | win-cur {:>6.1}ns | ins {:>9.1}ns | del {:>9.1}ns",
+        A::label(),
+        build_a,
+        mem_a,
+        ra.0,
+        ra.1,
+        ra.2,
+        ra.3,
+        ra.4,
+        ins_a,
+        del_a
+    );
+    println!(
+        "  {:<10} build {:>8.2}ms | mem {:>5.2}MB | find_le rand {:>6.1}ns seq {:>5.1}ns | iter {:>5.2}ns/e | win {:>6.1}ns | win-cur {:>6.1}ns | ins {:>9.1}ns | del {:>9.1}ns",
+        B::label(),
+        build_b,
+        mem_b,
+        rb.0,
+        rb.1,
+        rb.2,
+        rb.3,
+        rb.4,
+        ins_b,
+        del_b
+    );
+}
+
 struct Metrics {
     build_ms: f64,
     mem_mb: f64,
@@ -434,14 +729,12 @@ fn main() {
         // ① 稀疏均匀：步长 997（键域远大于元素数）。
         println!("\n## n = {n}  稀疏均匀（step=997）");
         let sparse = |i: usize| (i as i64) * 997;
-        print_row::<VecSorted, _>(n, sparse, win);
-        print_row::<Jump, _>(n, sparse, win);
+        print_pair::<VecSorted, Jump, _>(n, sparse, win);
 
         // ② 聚簇：每组 100 个键密集排布（间距 1），组间跳 100_000。
         println!("## n = {n}  聚簇（100 键/组，组间跳 100_000）");
         let clustered = |i: usize| ((i / 100) as i64) * 100_000 + (i % 100) as i64;
-        print_row::<VecSorted, _>(n, clustered, win);
-        print_row::<Jump, _>(n, clustered, win);
+        print_pair::<VecSorted, Jump, _>(n, clustered, win);
     }
 
     // ③ 阈值扫描：同一个 JumpArray，只改"块内线性扫上限"，看查询/窗口的拐点。
