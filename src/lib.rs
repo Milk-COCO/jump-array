@@ -72,6 +72,10 @@ impl Key for f64 {
 }
 
 /// 有序容器（key 唯一、按 key 升序）。
+///
+/// ⚠️ **刻意不实现 `Clone`**：游标用 `id` 识别实例，克隆副本若沿用同一个 `id`，
+/// 旧游标会在副本上"看似有效"却指向不同数据。若将来要加 `Clone`，必须给新副本
+/// 分配新的 `id`（并保持 `version` 语义）。
 pub struct JumpArray<K: Key, E> {
     entries: Vec<(K, E)>,
     /// 块起点 → 第一个 `key >= block_start` 的条目下标。
@@ -317,6 +321,15 @@ impl<K: Key, E> JumpArray<K, E> {
 
     /// 删除；不存在返回 `None`。
     pub fn remove(&mut self, key: &K) -> Option<E> {
+        // 删末尾的快速路径：按序清理/回滚时就是"总是删最后一个"，省掉一次二分。
+        if let Some((last, _)) = self.entries.last() {
+            if last.cmp_key(key) == Ordering::Equal {
+                let (_, v) = self.entries.pop().expect("刚判过非空");
+                self.dirty = true;
+                self.version = self.version.wrapping_add(1);
+                return Some(v);
+            }
+        }
         let pos = self.lower_bound(key);
         if pos >= self.entries.len() || self.entries[pos].0.cmp_key(key) != Ordering::Equal {
             return None;
@@ -927,6 +940,24 @@ mod tests {
                 "find_ge_from {q}"
             );
         }
+    }
+
+    /// 删末尾走快速路径：按序回滚/清理时正确且保持查询一致。
+    #[test]
+    fn remove_last_is_fast_and_correct() {
+        let mut a = JumpArray::<i64, u8>::new();
+        for i in 0..100 {
+            a.insert(i * 2, 0).unwrap();
+        }
+        a.rebuild();
+        for i in (0..100i64).rev() {
+            assert_eq!(a.remove(&(i * 2)), Some(0), "删 {i}");
+            if i % 10 == 0 {
+                a.rebuild();
+            }
+        }
+        assert!(a.is_empty());
+        assert_eq!(a.remove(&0), None);
     }
 
     /// 升序插入走追加快路径：顺序、去重、脏标记都对。
