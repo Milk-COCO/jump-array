@@ -1333,7 +1333,7 @@ mod tests {
     }
 }
 
-#[cfg(feature = "ratio")]
+#[cfg(all(test, feature = "ratio"))]
 mod ratio_tests {
     use super::*;
     use fraction::Ratio;
