@@ -344,31 +344,39 @@ fn measure<S: Store>(n: usize, key: impl Fn(usize) -> i64, win: usize) -> Metric
     let inserts: Vec<i64> = (0..add)
         .map(|_| (rng.below((n as u64) * 997 * 2)) as i64)
         .collect();
-    let ins_ns = bench(|| {
+    // 构建放在计时之外：否则 `ins_ns`/`del_ns` 里混着 O(n) 的建表成本，
+    // 大 n 时会被误读成"单次插入很慢"。
+    let mut best_ins = f64::MAX;
+    for _ in 0..ROUNDS {
         let mut s = S::new();
         for i in 0..n {
             s.insert(key(i), i as u32).ok();
         }
+        s.finalize();
+        let t = Instant::now();
         for (j, k) in inserts.iter().enumerate() {
             s.insert(*k, j as u32).ok();
         }
-        s.finalize();
         black_box(s.mem_bytes());
-    }) * 1e9
-        / add as f64;
+        best_ins = best_ins.min(t.elapsed().as_secs_f64());
+    }
+    let ins_ns = best_ins * 1e9 / add as f64;
 
     let removes: Vec<i64> = inserts.clone();
-    let del_ns = bench(|| {
+    let mut best_del = f64::MAX;
+    for _ in 0..ROUNDS {
         let mut s = S::new();
         for i in 0..n {
             s.insert(key(i), i as u32).ok();
         }
+        let t = Instant::now();
         for k in &removes {
             s.remove(k);
         }
         black_box(s.mem_bytes());
-    }) * 1e9
-        / removes.len() as f64;
+        best_del = best_del.min(t.elapsed().as_secs_f64());
+    }
+    let del_ns = best_del * 1e9 / removes.len() as f64;
 
     Metrics {
         build_ms,
