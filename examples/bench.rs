@@ -85,6 +85,20 @@ impl Store for VecSorted {
     fn mem_bytes(&self) -> usize {
         self.v.capacity() * std::mem::size_of::<(i64, u32)>()
     }
+    /// 直接走切片（默认实现会经 `range` 的 `Box<dyn Iterator>`，每窗多一次分配）。
+    fn window_sum(&self, key: &dyn Fn(usize) -> i64, wins: usize, n: usize, win: usize) -> i64 {
+        let mut acc = 0i64;
+        for w in 0..wins {
+            let lo = key(w * win);
+            let hi = key(((w + 1) * win).min(n - 1));
+            let a = self.v.partition_point(|(x, _)| *x < lo);
+            let b = self.v.partition_point(|(x, _)| *x <= hi);
+            for (k, _) in &self.v[a..b] {
+                acc = acc.wrapping_add(*k);
+            }
+        }
+        acc
+    }
     fn label() -> &'static str {
         "vec+二分"
     }
@@ -159,6 +173,18 @@ impl<const LM: usize> Store for JumpTuned<LM> {
     fn mem_bytes(&self) -> usize {
         let (blocks, len, _) = self.0.stats();
         len * std::mem::size_of::<(i64, u32)>() + blocks * 4
+    }
+    fn window_sum(&self, key: &dyn Fn(usize) -> i64, wins: usize, n: usize, win: usize) -> i64 {
+        let mut cur = self.0.cursor();
+        let mut acc = 0i64;
+        for w in 0..wins {
+            let lo = key(w * win);
+            let hi = key(((w + 1) * win).min(n - 1));
+            for (k, _) in self.0.range_from(&mut cur, lo, hi) {
+                acc = acc.wrapping_add(*k);
+            }
+        }
+        acc
     }
     fn finalize(&mut self) {
         self.0.rebuild();

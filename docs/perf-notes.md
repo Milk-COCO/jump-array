@@ -76,12 +76,12 @@
     - 验法：构造"写 1 次 / 查 1000 次"与"写 1 次 / 查 10 次"两种节奏，比较
       "不 rebuild（二分）"与"每次写完 rebuild"。
 
-12. **`range_end_from` 的 hi 与 lo 同块时**
-    - 现状：先扫 8 项，再 `upper_bound_fast(hi)`（含一次 `block_of(hi)` 除法 + 块表加载）。
-    - 怀疑：聚簇窗口（64 项 < 块内 100 项）里 hi 与 lo 基本同块，可以复用已算出的
-      块区间，省掉第二次 `block_of` + 块表加载。
-    - 验法：给 `range_end_from` 传入 `(start,end)` 区间，若 `hi < end_key` 就在
-      `[from,end)` 内二分；否则回退。用 `window_split` 的 pos 列对比。
+12. ~~**`range_end_from` 的 hi 与 lo 同块时**~~
+    - **已修**：大步路径改成"直接用 `hi` 所在块定位"：`b = block_of(hi)` →
+      `block_span(b)` → 块尾元素 ≥ hi 时在 `[max(from,start), end)` 内二分；
+      块尾 < hi 时答案就是 `end`（`end` 之后的首元素 key ≥ 下一块起点 > hi）。
+      省掉原来"扫 8 项 + 再 `upper_bound_fast` 重新 block_of"的一次除法与块表加载。
+      边界测试：`range_upper_bound_crosses_blocks`（跨块/超末尾/空区间/同块）。
 
 ## 测量方法本身的坑（先修这个，再信数字）
 

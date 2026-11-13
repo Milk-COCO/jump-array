@@ -463,6 +463,9 @@ impl<K: Key, E> JumpArray<K, E> {
     /// **不能按窗口大小取**：窗口越大，线性探重复走的元素越多，反而比直接二分贵。
     fn range_end_from(&self, from: usize, hi: &K) -> usize {
         const RANGE_SCAN_MAX: usize = 8;
+        if self.dirty || self.blocks.is_empty() {
+            return self.upper_bound(hi).max(from);
+        }
         let n = self.entries.len();
         let mut to = from;
         while to < n
@@ -471,11 +474,23 @@ impl<K: Key, E> JumpArray<K, E> {
         {
             to += 1;
         }
-        if to - from >= RANGE_SCAN_MAX && to < n && self.entries[to].0.cmp_key(hi) != Ordering::Greater
-        {
-            to = self.upper_bound_fast(hi).max(from);
+        if to - from < RANGE_SCAN_MAX || to == n {
+            // 探测窗口内已越过 hi，或已到末尾：不必再查块表。
+            return to;
         }
-        to
+        // 大步：直接用 `hi` 所在块定位（省掉第二次 `block_of` 的除法与块表加载）。
+        let b = self.block_of(hi);
+        let (start, end) = self.block_span(b);
+        if start >= end {
+            return end.max(from);
+        }
+        // `end` 之后的首元素 key ≥ 下一块起点 > hi，所以答案不超过 `end`。
+        if self.entries[end - 1].0.cmp_key(hi) == Ordering::Less {
+            return end;
+        }
+        let lo = from.max(start);
+        lo + self.entries[lo..end]
+            .partition_point(|(x, _)| x.cmp_key(hi) != Ordering::Greater)
     }
 
     /// 按下标取条目（配合 [`RangeIter::span`] / [`Cursor::pos`] 使用）。
@@ -1041,6 +1056,27 @@ mod tests {
             a.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
             (0..1000).map(|i| i * 3).collect::<Vec<_>>()
         );
+    }
+
+    /// 上界跨块 / 超出末尾 / 空区间：新定位路径的边界。
+    #[test]
+    fn range_upper_bound_crosses_blocks() {
+        let mut a = JumpArray::<i64, u8>::new();
+        for i in 0..1000i64 {
+            a.insert(i * 10, 0).unwrap();
+        }
+        a.rebuild();
+        // 跨很多块
+        let got: Vec<i64> = a.range(0, 5000).map(|(k, _)| *k).collect();
+        assert_eq!(got, (0..=500).map(|i| i * 10).collect::<Vec<_>>());
+        // hi 超出末尾
+        let got: Vec<i64> = a.range(9990, 1_000_000).map(|(k, _)| *k).collect();
+        assert_eq!(got, vec![9990]);
+        // 空区间（无元素）
+        assert_eq!(a.range(5005, 5009).count(), 0);
+        // 起点在更晚的块、上界在同块
+        let got: Vec<i64> = a.range(7000, 7009).map(|(k, _)| *k).collect();
+        assert_eq!(got, vec![7000]);
     }
 
     /// 删末尾走快速路径：按序回滚/清理时正确且保持查询一致。
