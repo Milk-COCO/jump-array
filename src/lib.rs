@@ -94,7 +94,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone, Copy)]
 pub struct Cursor {
     id: u64,
-    version: u64,
+    version: u32,
     pos: usize,
 }
 
@@ -131,7 +131,7 @@ pub struct JumpArray<K: Key, E> {
     minor_anchors: bool,
     id: u64,
     /// 写入代数：`insert`/`remove` +1；`rebuild` 不改下标，故不变。
-    version: u64,
+    version: u32,
 }
 
 impl<K: Key, E> Default for JumpArray<K, E> {
