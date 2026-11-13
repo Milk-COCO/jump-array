@@ -86,6 +86,8 @@ pub struct JumpArray<K: Key, E> {
     dirty: bool,
     /// 块内元素数不超过它时线性扫，超过则块内二分（可调）。
     linear_max: usize,
+    /// 块宽倍数（1.0 = 平均每块一个元素；>1 块更少更宽，块内扫更多）。
+    width_scale: f64,
     /// 实例唯一 id（游标跨实例误用检测）。
     id: u64,
     /// 写入代数：`insert`/`remove` +1；`rebuild` 不改下标，故不变。
@@ -131,12 +133,24 @@ impl<K: Key, E> JumpArray<K, E> {
             width: 1.0,
             dirty: true,
             linear_max: DEFAULT_LINEAR_MAX,
+            width_scale: 1.0,
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             version: 0,
         }
     }
 
     /// 调整"块内线性扫"阈值（块内元素数超过它则块内二分）。
+    /// 块宽倍数：`1.0` 是"平均每块一个元素"；`k` 倍 ⇒ 块数约为 1/k，
+    /// 块表更小（更可能进 L1/L2），但块内要多扫约 k 项。
+    pub fn with_width_scale(mut self, scale: f64) -> Self {
+        self.width_scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        self
+    }
+
     pub fn with_linear_max(mut self, linear_max: usize) -> Self {
         self.linear_max = linear_max.max(1);
         self
@@ -234,7 +248,7 @@ impl<K: Key, E> JumpArray<K, E> {
         let first = self.entries[0].0.to_f64();
         let last = self.entries[self.entries.len() - 1].0.to_f64();
         let span = (last - first).max(0.0);
-        let width = pow2_ceil(span / self.entries.len().max(1) as f64);
+        let width = pow2_ceil(span / self.entries.len().max(1) as f64) * self.width_scale;
         self.base = first;
         self.width = width;
         let nblocks = ((span / width).ceil() as usize).saturating_add(1).max(1);
@@ -974,6 +988,32 @@ mod tests {
                 a.find_ge(&q).map(|(k, _)| *k),
                 "find_ge_from {q}"
             );
+        }
+    }
+
+    /// 块宽倍数不影响正确性（只改块表大小与块内扫长度）。
+    #[test]
+    fn width_scale_keeps_results_correct() {
+        let keys: Vec<i64> = (0..2000i64)
+            .map(|i| (i / 100) * 100_000 + (i % 100))
+            .collect();
+        for scale in [0.5f64, 1.0, 2.0, 4.0, 8.0] {
+            let mut a = JumpArray::<i64, u8>::new().with_width_scale(scale);
+            for k in &keys {
+                a.insert(*k, 0).unwrap();
+            }
+            a.rebuild();
+            for q in (0..600).map(|i| i * 331) {
+                let le = keys.partition_point(|x| *x <= q);
+                assert_eq!(
+                    a.find_le(&q).map(|(k, _)| *k),
+                    (le > 0).then(|| keys[le - 1]),
+                    "scale={scale} find_le {q}"
+                );
+            }
+            let got: Vec<i64> = a.range(0, 150).map(|(k, _)| *k).collect();
+            let want: Vec<i64> = keys.iter().copied().filter(|x| *x <= 150).collect();
+            assert_eq!(got, want, "scale={scale} range");
         }
     }
 

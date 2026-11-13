@@ -437,6 +437,54 @@ fn main() {
     );
     window_split(n, "稀疏均匀", sparse, win);
     window_split(n, "聚簇    ", clustered, win);
+
+    // ⑤ 块宽倍数扫描：块表更小（更可能进缓存）vs 块内扫更多。
+    println!("\n## 块宽倍数扫描 n = {n}（scale=1 是平均每块一个元素）");
+    width_scale_sweep(n, "稀疏均匀", sparse, win);
+    width_scale_sweep(n, "聚簇    ", clustered, win);
+}
+
+fn width_scale_sweep(n: usize, label: &str, key: impl Fn(usize) -> i64 + Copy, win: usize) {
+    let wins = (n / win).max(1);
+    let probes = 100_000usize.min(n.saturating_mul(10)).max(1_000);
+    let mut rng = Rng(0x1234_5678_9abc_def0);
+    let qs: Vec<i64> = (0..probes)
+        .map(|_| rng.below((n as u64) * 997 * 2) as i64)
+        .collect();
+    for scale in [0.5f64, 1.0, 2.0, 4.0, 8.0] {
+        let mut a = JumpArray::<i64, u32>::new().with_width_scale(scale);
+        for i in 0..n {
+            a.insert(key(i), i as u32).ok();
+        }
+        a.rebuild();
+        let (blocks, _, width) = a.stats();
+        let rand = bench(|| {
+            let mut acc = 0i64;
+            for q in &qs {
+                if let Some((k, _)) = a.find_le(q) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+            black_box(acc);
+        }) * 1e9
+            / probes as f64;
+        let wincur = bench(|| {
+            let mut cur = a.cursor();
+            let mut acc = 0i64;
+            for w in 0..wins {
+                let lo = key(w * win);
+                let hi = key(((w + 1) * win).min(n - 1));
+                for (k, _) in a.range_from(&mut cur, lo, hi) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+            black_box(acc);
+        }) * 1e9
+            / wins as f64;
+        println!(
+            "  {label} scale {scale:>4} blocks {blocks:>7} W {width:>12.0} | rand {rand:>6.1}ns | win-cur {wincur:>6.1}ns"
+        );
+    }
 }
 
 /// 把"定位"和"迭代"分开计时：两边都按同样的 `win` 元素窗口序列。
