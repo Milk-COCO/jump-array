@@ -774,7 +774,7 @@ fn main() {
     }
     win = win.max(1);
     println!("# JumpArray vs Vec+二分（probe 过滤 + 中位数，窗口 {win} 元素）");
-    for n in [1_000usize, 10_000, 100_000, 1_000_000] {
+    for n in [1_000usize, 10_000, 100_000, 1_000_000, 4_000_000] {
         if n > max_n {
             break;
         }
