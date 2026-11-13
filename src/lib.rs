@@ -372,6 +372,26 @@ impl<K: Key, E> JumpArray<K, E> {
         self.keys.iter().zip(self.vals.iter())
     }
 
+    /// 只读切片视图 `(keys, vals)`：两者等长、同下标对应。
+    pub fn as_slices(&self) -> (&[K], &[E]) {
+        (&self.keys, &self.vals)
+    }
+
+    /// 消费容器，按升序取出全部值（键可由值派生时用）。
+    pub fn into_sorted_vec(self) -> Vec<E> {
+        self.vals
+    }
+
+    /// 下界下标：第一个 `key >= k` 的位置（等于 `len` 表示都小于 `k`）。
+    pub fn lower_bound_index(&self, k: &K) -> usize {
+        self.lower_bound_fast(k)
+    }
+
+    /// 上界下标：第一个 `key > k` 的位置。
+    pub fn upper_bound_index(&self, k: &K) -> usize {
+        self.upper_bound_fast(k)
+    }
+
     /// 重建块表（幂等：干净时直接返回）。
     ///
     /// 块宽取 `2^shift`，`shift` 由"平均每个元素占的数值跨度"估算；块号本身由
@@ -1039,6 +1059,30 @@ mod tests {
             let want: Vec<i64> = (start..start + count).map(|i| (i as i64) * 997).collect();
             assert_eq!(got, want);
         }
+    }
+
+    /// 下标入口与切片视图。
+    #[test]
+    fn index_entries_match_queries() {
+        let mut a = JumpArray::<i64, u8>::new();
+        for i in 0..3000i64 {
+            a.insert(i * 3, (i % 7) as u8).unwrap();
+        }
+        a.rebuild();
+        for q in (0..3000i64).map(|i| i * 3 - 1) {
+            let lb = a.lower_bound_index(&q);
+            assert_eq!(a.entry(lb).map(|(k, _)| *k), a.find_ge(&q).map(|(k, _)| *k));
+            let ub = a.upper_bound_index(&q);
+            assert_eq!(a.entry(ub).map(|(k, _)| *k), a.find_gt(&q).map(|(k, _)| *k));
+        }
+        let (keys, vals) = a.as_slices();
+        assert_eq!(keys.len(), vals.len());
+        assert_eq!(keys.len(), 3000);
+        let owned = JumpArray::<i64, u8>::from_sorted(
+            (0..10).map(|i| (i * 5, i as u8)).collect(),
+        )
+        .into_sorted_vec();
+        assert_eq!(owned, (0..10).map(|i| i as u8).collect::<Vec<_>>());
     }
 
     /// 上界跨块 / 超出末尾 / 空区间。
