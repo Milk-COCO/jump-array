@@ -19,9 +19,9 @@
 //!   重建块表（O(n)）。升序追加走 `push` 快路径；
 //! * **脏索引**：`rebuild` 之前查询自动退回二分（O(log n)），结果仍然正确；
 //! * **小数组**：元素数 ≤ `binary_below`（默认 2048）时直接二分，跳过块索引；
-//! * **二级锚**（默认关闭）：`with_minor_anchors(true)` 时给"块内元素数 > 8"的
-//!   密集块再加 8 格锚点，块内定位从 ~7 次比较降到 1 次加载 + 短扫。实测对聚簇
-//!   随机查询略好、对顺序查询明显更差，故默认不开；
+//! * **块号精确计算**：块宽是 `2^shift`，块号由 [`Key::block_offset`] 在键自己的
+//!   类型上算——整数键用整数运算（大整数不会因 f64 量化被挤进同一块），内部以
+//!   f64 存储的键（`f64`、`Beat`）用 f64 运算；`to_f64` 只用来估 `shift`；
 //! * **顺序访问**：配套 [`Cursor`]（`find_le_from` / `find_ge_from` / `range_from`），
 //!   从上次位置双向线性推进，顺序窗口摊还 O(1)；游标带实例 id 与写入代数，过期或跨
 //!   实例时自动退回冷路径。
@@ -48,10 +48,30 @@
 
 use std::cmp::Ordering;
 
-/// 有序键：全序比较 + 数值化（块下标计算用）。
-pub trait Key: Copy + std::fmt::Debug {
+/// 有序键：全序比较 + 块号计算。
+///
+/// 块号默认在 f64 上算（`to_f64`）；整数类型覆写为**精确的整数运算**，因此
+/// 大整数键（超过 f64 的 53 位尾数）不会因为量化而把多个键挤进同一块。
+pub trait Key: Copy + std::fmt::Debug + Default {
     fn cmp_key(&self, other: &Self) -> Ordering;
     fn to_f64(self) -> f64;
+
+    /// 块号：`floor((self - base) / 2^shift)`，负数/越界由调用方截断。
+    ///
+    /// 默认实现走 f64；如果键自身精度是 f64（如 `f64`、内部以 f64 存储的
+    /// `Beat`），这就是精确的。整数键应覆写为整数运算。
+    #[inline]
+    fn block_offset(&self, base: &Self, shift: i32) -> usize {
+        let d = self.to_f64() - base.to_f64();
+        if d <= 0.0 || d.is_nan() {
+            return 0;
+        }
+        let x = d * 2f64.powi(-shift);
+        if !x.is_finite() {
+            return usize::MAX;
+        }
+        x as usize
+    }
 }
 
 macro_rules! impl_int_key {
@@ -59,6 +79,23 @@ macro_rules! impl_int_key {
         impl Key for $t {
             #[inline] fn cmp_key(&self, other: &Self) -> Ordering { self.cmp(other) }
             #[inline] fn to_f64(self) -> f64 { self as f64 }
+            /// 整数运算，精确。
+            #[inline]
+            fn block_offset(&self, base: &Self, shift: i32) -> usize {
+                let d = (*self as i128) - (*base as i128);
+                if d <= 0 {
+                    return 0;
+                }
+                if shift >= 0 {
+                    if shift >= 127 {
+                        return 0;
+                    }
+                    (d >> shift) as usize
+                } else {
+                    let m = (-shift) as u32;
+                    d.checked_shl(m).map(|v| v as usize).unwrap_or(usize::MAX)
+                }
+            }
         }
     )*};
 }
@@ -81,10 +118,6 @@ const DEFAULT_BINARY_BELOW: usize = 2048;
 const RANGE_SCAN_MAX: usize = 8;
 
 /// 块内元素数超过它就建二级锚。
-const MINOR_THRESHOLD: usize = 8;
-/// 二级锚把块切成几格（2 的幂便于取整）。
-const MINOR_PARTS: usize = 8;
-
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 顺序访问游标（属于某个 [`JumpArray`] 实例）。
@@ -114,21 +147,14 @@ pub struct JumpArray<K: Key, E> {
     vals: Vec<E>,
     /// 块起点 → 第一个 `key >= block_start` 的下标。
     blocks: Vec<u32>,
-    /// 二级锚（仅密集块）：`minor_base[b]` 是该块 8 个锚在 `minor` 里的起点，
-    /// `u32::MAX` 表示未展开。锚 j = 块内第 j/8 处的第一个 `key >= 起点`。
-    minor_base: Vec<u32>,
-    minor: Vec<u32>,
-    base: f64,
-    width: f64,
-    /// `1 / width`（width 是 2 的幂，倒数精确）。
-    inv_width: f64,
+    /// 块号锚点：块 `b` 的起点 = `base + b * 2^shift`（**在键自己的类型上算**）。
+    base: K,
+    shift: i32,
     dirty: bool,
     linear_max: usize,
     binary_below: usize,
     /// 区间上界的线性探上限（窗口极短时省一次块表查找）。
     span_scan_max: usize,
-    /// 块内元素数 > MINOR_THRESHOLD 时是否建二级锚。
-    minor_anchors: bool,
     id: u64,
     /// 写入代数：`insert`/`remove` +1；`rebuild` 不改下标，故不变。
     version: u32,
@@ -150,16 +176,12 @@ impl<K: Key, E: Clone> Clone for JumpArray<K, E> {
             keys: self.keys.clone(),
             vals: self.vals.clone(),
             blocks: self.blocks.clone(),
-            minor_base: self.minor_base.clone(),
-            minor: self.minor.clone(),
             base: self.base,
-            width: self.width,
-            inv_width: self.inv_width,
+            shift: self.shift,
             dirty: self.dirty,
             linear_max: self.linear_max,
             binary_below: self.binary_below,
             span_scan_max: self.span_scan_max,
-            minor_anchors: self.minor_anchors,
             id: NEXT_ID.fetch_add(1, AtomicOrdering::Relaxed),
             version: self.version,
         }
@@ -172,9 +194,8 @@ impl<K: Key, E> std::fmt::Debug for JumpArray<K, E> {
         f.debug_struct("JumpArray")
             .field("len", &self.keys.len())
             .field("blocks", &self.blocks.len())
-            .field("minor", &self.minor.len())
             .field("dirty", &self.dirty)
-            .field("width", &self.width)
+            .field("shift", &self.shift)
             .finish_non_exhaustive()
     }
 }
@@ -185,16 +206,12 @@ impl<K: Key, E> JumpArray<K, E> {
             keys: Vec::new(),
             vals: Vec::new(),
             blocks: Vec::new(),
-            minor_base: Vec::new(),
-            minor: Vec::new(),
-            base: 0.0,
-            width: 1.0,
-            inv_width: 1.0,
+            base: K::default(),
+            shift: 0,
             dirty: true,
             linear_max: DEFAULT_LINEAR_MAX,
             binary_below: DEFAULT_BINARY_BELOW,
             span_scan_max: RANGE_SCAN_MAX,
-            minor_anchors: false,
             id: NEXT_ID.fetch_add(1, AtomicOrdering::Relaxed),
             version: 0,
         }
@@ -207,7 +224,7 @@ impl<K: Key, E> JumpArray<K, E> {
         s
     }
 
-    /// 调整"块内线性扫"阈值（块内元素数超过它则块内二分；建了二级锚时不受它影响）。
+    /// 调整"块内线性扫"阈值（块内元素数超过它则块内二分）。
     pub fn with_linear_max(mut self, linear_max: usize) -> Self {
         self.linear_max = linear_max.max(1);
         self
@@ -225,12 +242,6 @@ impl<K: Key, E> JumpArray<K, E> {
     /// 区间上界的线性探上限（默认 8）：窗口很短时线性探比"块表 + 二分"便宜。
     pub fn with_span_scan_max(mut self, n: usize) -> Self {
         self.span_scan_max = n;
-        self
-    }
-
-    /// 是否给密集块建二级锚（默认开；关掉用于对照）。
-    pub fn with_minor_anchors(mut self, on: bool) -> Self {
-        self.minor_anchors = on;
         self
     }
 
@@ -285,14 +296,9 @@ impl<K: Key, E> JumpArray<K, E> {
         self.keys.is_empty()
     }
 
-    /// 索引诊断：`(块表长度, 二级锚个数, 元素数, 块宽)`。
-    pub fn stats(&self) -> (usize, usize, usize, f64) {
-        (
-            self.blocks.len(),
-            self.minor.len(),
-            self.keys.len(),
-            self.width,
-        )
+    /// 索引诊断：`(块表长度, 元素数, 块宽)`。
+    pub fn stats(&self) -> (usize, usize, f64) {
+        (self.blocks.len(), self.keys.len(), 2f64.powi(self.shift))
     }
 
     /// 索引是否被写入弄脏（`true` ⇒ 查询退回二分）。
@@ -324,58 +330,51 @@ impl<K: Key, E> JumpArray<K, E> {
         self.keys.iter().zip(self.vals.iter())
     }
 
-    /// 重建块表与二级锚（幂等：干净时直接返回）。
+    /// 重建块表（幂等：干净时直接返回）。
+    ///
+    /// 块宽取 `2^shift`，`shift` 由"平均每个元素占的数值跨度"估算；块号本身由
+    /// [`Key::block_offset`] 在**键自己的类型上精确计算**，`shift` 只决定块的粒度。
     pub fn rebuild(&mut self) {
         if !self.dirty {
             return;
         }
         self.blocks.clear();
-        self.minor_base.clear();
-        self.minor.clear();
         if self.keys.is_empty() {
-            self.base = 0.0;
-            self.width = 1.0;
-            self.inv_width = 1.0;
+            self.base = K::default();
+            self.shift = 0;
             self.dirty = false;
             return;
         }
-        let first = self.keys[0].to_f64();
-        let last = self.keys[self.keys.len() - 1].to_f64();
-        let span = (last - first).max(0.0);
-        let width = pow2_ceil(span / self.keys.len().max(1) as f64);
+        let n = self.keys.len();
+        let first = self.keys[0];
+        let lastf = self.keys[n - 1].to_f64();
+        let span_f = (lastf - first.to_f64()).max(0.0);
+        let mut shift = 0i32;
+        if span_f > 0.0 {
+            let per = span_f / n as f64;
+            shift = per.log2().ceil().clamp(-60.0, 60.0) as i32;
+        }
+        // 块数上限：`shift` 由 f64 估算，遇到"键跨度极大但元素少"的数据可能算出
+        // 天量空块。把 shift 抬到块数 ≤ 4n+64 为止（只会让块更粗，不影响正确性）。
+        let cap = 4 * n + 64;
+        while self.keys[n - 1].block_offset(&first, shift) > cap {
+            shift += 1;
+        }
         self.base = first;
-        self.width = width;
-        self.inv_width = 1.0 / width;
-        let nblocks = ((span / width).ceil() as usize).saturating_add(1).max(1);
-        self.blocks.reserve(nblocks);
-        let mut i = 0usize;
-        for b in 0..nblocks {
-            let start = first + b as f64 * width;
-            while i < self.keys.len() && self.keys[i].to_f64() < start {
-                i += 1;
-            }
-            self.blocks.push(i as u32);
-        }
-        if self.minor_anchors {
-            self.minor_base.reserve(nblocks);
-            for b in 0..nblocks {
-                let (start, end) = self.block_span(b);
-                if end - start <= MINOR_THRESHOLD {
-                    self.minor_base.push(u32::MAX);
-                    continue;
+        self.shift = shift;
+        let last_b = self.keys[n - 1].block_offset(&first, shift).min(cap);
+        let mut blocks = vec![0u32; last_b + 1];
+        let mut cur = 0usize;
+        for (i, k) in self.keys.iter().enumerate() {
+            let b = k.block_offset(&first, shift).min(last_b);
+            if b > cur {
+                for slot in blocks.iter_mut().take(b + 1).skip(cur + 1) {
+                    *slot = i as u32;
                 }
-                let base_idx = self.minor.len() as u32;
-                self.minor_base.push(base_idx);
-                let block_start = self.base + b as f64 * self.width;
-                let cell = self.width / MINOR_PARTS as f64;
-                for j in 0..MINOR_PARTS {
-                    let s = block_start + j as f64 * cell;
-                    let lo = self.keys[start..end]
-                        .partition_point(|x| x.to_f64() < s);
-                    self.minor.push((start + lo) as u32);
-                }
+                cur = b;
             }
         }
+        self.blocks = blocks;
         self.dirty = false;
     }
 
@@ -389,16 +388,11 @@ impl<K: Key, E> JumpArray<K, E> {
         if self.blocks.is_empty() {
             return 0;
         }
-        let x = (k.to_f64() - self.base) * self.inv_width;
-        if !x.is_finite() || x <= 0.0 {
-            0
+        let b = k.block_offset(&self.base, self.shift);
+        if b >= self.blocks.len() {
+            self.blocks.len() - 1
         } else {
-            let b = x.floor();
-            if b >= self.blocks.len() as f64 {
-                self.blocks.len() - 1
-            } else {
-                b as usize
-            }
+            b
         }
     }
 
@@ -411,23 +405,6 @@ impl<K: Key, E> JumpArray<K, E> {
             self.keys.len()
         };
         (start, end)
-    }
-
-    /// 块内起点：有二级锚就按 `key` 落在哪一格取，否则用块表锚点。
-    #[inline]
-    fn block_anchor(&self, b: usize, k: &K) -> usize {
-        if !self.minor_anchors || self.minor_base.is_empty() {
-            return self.blocks[b] as usize;
-        }
-        let mb = self.minor_base[b];
-        if mb == u32::MAX {
-            return self.blocks[b] as usize;
-        }
-        let block_start = self.base + b as f64 * self.width;
-        let cell = self.width / MINOR_PARTS as f64;
-        let j = (((k.to_f64() - block_start) / cell).floor() as isize).clamp(0, MINOR_PARTS as isize - 1)
-            as usize;
-        self.minor[mb as usize + j] as usize
     }
 
     fn lower_bound(&self, k: &K) -> usize {
@@ -444,13 +421,8 @@ impl<K: Key, E> JumpArray<K, E> {
         if !self.use_index() {
             return self.lower_bound(k);
         }
-        let b = self.block_of(k);
-        let (_, end) = self.block_span(b);
-        let start = self.block_anchor(b, k);
-        let has_minor = self.minor_anchors
-            && !self.minor_base.is_empty()
-            && self.minor_base[b] != u32::MAX;
-        if has_minor || end - start <= self.linear_max {
+        let (start, end) = self.block_span(self.block_of(k));
+        if end - start <= self.linear_max {
             let mut i = start;
             while i < end && self.keys[i].cmp_key(k) == Ordering::Less {
                 i += 1;
@@ -466,13 +438,8 @@ impl<K: Key, E> JumpArray<K, E> {
         if !self.use_index() {
             return self.upper_bound(k);
         }
-        let b = self.block_of(k);
-        let (_, end) = self.block_span(b);
-        let start = self.block_anchor(b, k);
-        let has_minor = self.minor_anchors
-            && !self.minor_base.is_empty()
-            && self.minor_base[b] != u32::MAX;
-        if has_minor || end - start <= self.linear_max {
+        let (start, end) = self.block_span(self.block_of(k));
+        if end - start <= self.linear_max {
             let mut i = start;
             while i < end && self.keys[i].cmp_key(k) != Ordering::Greater {
                 i += 1;
@@ -738,14 +705,6 @@ impl<K: Key, E> JumpArray<K, E> {
     }
 }
 
-fn pow2_ceil(x: f64) -> f64 {
-    if !x.is_finite() || x <= 0.0 {
-        return 1.0;
-    }
-    let e = x.log2().ceil().clamp(-60.0, 40.0);
-    2f64.powf(e)
-}
-
 /// [`JumpArray::range`] / [`JumpArray::range_from`] 的迭代器（两个切片 zip）。
 pub struct RangeIter<'a, K: Key, E> {
     keys: &'a [K],
@@ -942,10 +901,45 @@ mod tests {
             a.insert(i as f64 * 1e6, 0).unwrap();
         }
         a.rebuild();
-        let (blocks, _, len, _) = a.stats();
+        let (blocks, len, _) = a.stats();
         assert_eq!(len, 4000);
         assert!(blocks < 3 * len, "blocks={blocks} len={len}");
         assert!(a.index_used());
+    }
+
+    /// 大整数键：块号在 i64 上精确计算，不会被 f64 量化挤成少数块。
+    #[test]
+    fn large_integer_keys_keep_block_granularity() {
+        let base: i64 = 1 << 60;
+        let mut a = JumpArray::<i64, u8>::new();
+        for i in 0..4096i64 {
+            a.insert(base + i, 0).unwrap();
+        }
+        a.rebuild();
+        let (blocks, len, _) = a.stats();
+        assert_eq!(len, 4096);
+        // 2^60 附近相邻整数在 f64 里是同一个值；走 f64 的话块数会远小于 n。
+        assert!(blocks > 2000, "blocks={blocks}");
+        for i in (0..4096i64).step_by(7) {
+            let k = base + i;
+            assert_eq!(a.find_le(&k).map(|(x, _)| *x), Some(k));
+            assert_eq!(a.find_ge(&k).map(|(x, _)| *x), Some(k));
+        }
+        let got: Vec<i64> = a.range(base + 100, base + 163).map(|(x, _)| *x).collect();
+        assert_eq!(got, (100..=163i64).map(|i| base + i).collect::<Vec<_>>());
+    }
+
+    /// 键跨度极大但元素很少时，块表不会爆炸（shift 会被抬高）。
+    #[test]
+    fn huge_span_does_not_explode_block_table() {
+        let mut a = JumpArray::<i64, u8>::new();
+        for i in 0..8i64 {
+            a.insert(i << 58, 0).unwrap();
+        }
+        a.rebuild();
+        let (blocks, _, _) = a.stats();
+        assert!(blocks <= 4 * 8 + 64, "blocks={blocks}");
+        assert_eq!(a.find_le(&(3i64 << 58)).map(|(k, _)| *k), Some(3i64 << 58));
     }
 
     /// `rebuild` 幂等：干净时不必重算。
@@ -956,9 +950,9 @@ mod tests {
             a.insert(i * 3, 0).unwrap();
         }
         a.rebuild();
-        let (b1, m1, l1, w1) = a.stats();
+        let (b1, l1, w1) = a.stats();
         a.rebuild();
-        assert_eq!(a.stats(), (b1, m1, l1, w1));
+        assert_eq!(a.stats(), (b1, l1, w1));
         a.insert(1, 0).unwrap();
         assert!(a.is_dirty());
         a.rebuild();
@@ -1271,40 +1265,6 @@ mod tests {
         assert!(a.index_used(), "3000 条应走块索引");
         assert_eq!(a.find_le(&4500).map(|(k, _)| *k), Some(4500));
         assert_eq!(a.find_ge(&4501).map(|(k, _)| *k), Some(4503));
-    }
-
-    /// 二级锚不影响结果，且确实被建立。
-    #[test]
-    fn minor_anchors_agree_with_plain_path() {
-        let key = |i: usize| ((i / 100) as i64) * 100_000 + (i % 100) as i64;
-        let mut with = JumpArray::<i64, u8>::new().with_minor_anchors(true);
-        let mut without = JumpArray::<i64, u8>::new().with_minor_anchors(false);
-        for i in 0..5000 {
-            with.insert(key(i), 0).unwrap();
-            without.insert(key(i), 0).unwrap();
-        }
-        with.rebuild();
-        without.rebuild();
-        assert!(with.stats().1 > 0, "聚簇数据应建立二级锚");
-        assert_eq!(without.stats().1, 0);
-        for q in (0..5000).map(|i| i * 37) {
-            assert_eq!(
-                with.find_le(&q).map(|(k, _)| *k),
-                without.find_le(&q).map(|(k, _)| *k),
-                "le {q}"
-            );
-            assert_eq!(
-                with.find_ge(&q).map(|(k, _)| *k),
-                without.find_ge(&q).map(|(k, _)| *k),
-                "ge {q}"
-            );
-        }
-        let lo = key(0);
-        let hi = key(4999);
-        assert_eq!(
-            with.range(lo, hi).map(|(k, _)| *k).collect::<Vec<_>>(),
-            without.range(lo, hi).map(|(k, _)| *k).collect::<Vec<_>>()
-        );
     }
 
     /// `x / 2^k == x * 2^-k`（f64 上逐位等价），故 `block_of` 可换乘法。
