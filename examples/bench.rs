@@ -758,6 +758,7 @@ fn print_row<S: Store, F: Fn(usize) -> i64 + Copy>(n: usize, key: F, win: usize)
 fn main() {
     let mut max_n = 100_000usize;
     let mut win = 64usize;
+    let mut sweep_only = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -767,12 +768,26 @@ fn main() {
                     .and_then(|s| s.parse().ok())
                     .expect("--win 需要数字");
             }
+            "--sweep" => sweep_only = true,
             other => {
                 max_n = other.parse().expect("位置参数是最大规模 n");
             }
         }
     }
     win = win.max(1);
+    let sparse = |i: usize| (i as i64) * 997;
+    let clustered = |i: usize| ((i / 100) as i64) * 100_000 + (i % 100) as i64;
+    if sweep_only {
+        // 只跑参数扫描：几秒级，用来找块宽/二分阈值的拐点。
+        println!("# 参数扫描 n = {max_n}（窗口 {win}）");
+        println!("\n## 块宽倍数扫描");
+        width_scale_sweep(max_n, "稀疏均匀", sparse, win);
+        width_scale_sweep(max_n, "聚簇    ", clustered, win);
+        println!("\n## 小数组二分阈值扫描");
+        binary_below_sweep(max_n, "稀疏均匀", sparse, win);
+        binary_below_sweep(max_n, "聚簇    ", clustered, win);
+        return;
+    }
     println!("# JumpArray vs Vec+二分（probe 过滤 + 中位数，窗口 {win} 元素）");
     for n in [1_000usize, 10_000, 100_000, 1_000_000, 4_000_000] {
         if n > max_n {
