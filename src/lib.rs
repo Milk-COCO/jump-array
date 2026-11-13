@@ -41,6 +41,10 @@
 //! | 区间 / 遍历 | O(长度)，连续切片；上界定位先线性探 8 项再回退块内二分 |
 //! | 顺序查询/窗口（游标） | 摊还 O(1) 起跳；单次 O(距离)，超 32 步回退块索引 |
 //! | 内存 | 载荷 + 4 B/元素 |
+//!
+//! ⭐ **小数组自动走二分**：元素数 ≤ `binary_below`（默认 2048，可用
+//! [`JumpArray::with_binary_below`] 调）时跳过块索引——小数组整体在 L1 里，
+//! 十来次二分命中比"块表 + 条目"两次依赖加载更便宜。
 
 use std::cmp::Ordering;
 
@@ -88,6 +92,8 @@ pub struct JumpArray<K: Key, E> {
     linear_max: usize,
     /// 块宽倍数（1.0 = 平均每块一个元素；>1 块更少更宽，块内扫更多）。
     width_scale: f64,
+    /// 元素数不超过它时跳过块索引、直接用二分（小数组在 L1 里，二分更便宜）。
+    binary_below: usize,
     /// 实例唯一 id（游标跨实例误用检测）。
     id: u64,
     /// 写入代数：`insert`/`remove` +1；`rebuild` 不改下标，故不变。
@@ -96,6 +102,12 @@ pub struct JumpArray<K: Key, E> {
 
 /// `linear_max` 默认值。
 const DEFAULT_LINEAR_MAX: usize = 8;
+
+/// 小数组直接二分的默认阈值（元素数）。
+///
+/// 依据：32 KB L1 / 每条目 ~32 B ≈ 1k 条；实测 n=1k–2k 时二分胜过块索引、
+/// n≥8k 时块索引重新占优，取 2048 作保守分界。
+const DEFAULT_BINARY_BELOW: usize = 2048;
 
 /// 进程内自增的实例 id。
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -134,6 +146,7 @@ impl<K: Key, E> JumpArray<K, E> {
             dirty: true,
             linear_max: DEFAULT_LINEAR_MAX,
             width_scale: 1.0,
+            binary_below: DEFAULT_BINARY_BELOW,
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             version: 0,
         }
@@ -142,6 +155,15 @@ impl<K: Key, E> JumpArray<K, E> {
     /// 调整"块内线性扫"阈值（块内元素数超过它则块内二分）。
     /// 块宽倍数：`1.0` 是"平均每块一个元素"；`k` 倍 ⇒ 块数约为 1/k，
     /// 块表更小（更可能进 L1/L2），但块内要多扫约 k 项。
+    /// 元素数 ≤ `n` 时跳过块索引、直接用二分。
+    ///
+    /// 依据：小数组整个留在 L1，二分只有十来次命中；而块索引至少两次依赖加载
+    /// （块表 + 条目）加一次除法。阈值应由 `L1 / 元素大小` 估，默认 0（不启用）。
+    pub fn with_binary_below(mut self, n: usize) -> Self {
+        self.binary_below = n;
+        self
+    }
+
     pub fn with_width_scale(mut self, scale: f64) -> Self {
         self.width_scale = if scale.is_finite() && scale > 0.0 {
             scale
@@ -307,10 +329,22 @@ impl<K: Key, E> JumpArray<K, E> {
         (start, end)
     }
 
+    /// 查询当前实际走的是不是块索引（`false` ⇒ 走二分：索引脏、未建，或元素数
+    /// 不超过 `binary_below`）。
+    pub fn index_used(&self) -> bool {
+        self.use_index()
+    }
+
+    /// 小数组（≤ `binary_below`）直接用二分，跳过块索引。
+    #[inline]
+    fn use_index(&self) -> bool {
+        !self.dirty && !self.blocks.is_empty() && self.entries.len() > self.binary_below
+    }
+
     /// 索引起跳 + 块内短扫（块内元素多则二分）。
     #[inline]
     fn lower_bound_fast(&self, k: &K) -> usize {
-        if self.dirty || self.blocks.is_empty() {
+        if !self.use_index() {
             return self.lower_bound(k);
         }
         let (start, end) = self.block_span(self.block_of(k));
@@ -330,7 +364,7 @@ impl<K: Key, E> JumpArray<K, E> {
     /// 同上，取"第一个 `key > k`"。
     #[inline]
     fn upper_bound_fast(&self, k: &K) -> usize {
-        if self.dirty || self.blocks.is_empty() {
+        if !self.use_index() {
             return self.upper_bound(k);
         }
         let (start, end) = self.block_span(self.block_of(k));
@@ -463,7 +497,7 @@ impl<K: Key, E> JumpArray<K, E> {
     /// **不能按窗口大小取**：窗口越大，线性探重复走的元素越多，反而比直接二分贵。
     fn range_end_from(&self, from: usize, hi: &K) -> usize {
         const RANGE_SCAN_MAX: usize = 8;
-        if self.dirty || self.blocks.is_empty() {
+        if !self.use_index() {
             return self.upper_bound(hi).max(from);
         }
         let n = self.entries.len();
@@ -1003,7 +1037,54 @@ mod tests {
         }
     }
 
-    /// 块宽倍数不影响正确性（只改块表大小与块内扫长度）。
+    /// 默认阈值下：小数组走二分，大数组走块索引。
+    #[test]
+    fn small_arrays_skip_the_index_by_default() {
+        let mut a = JumpArray::<i64, u8>::new();
+        for i in 0..1000i64 {
+            a.insert(i * 3, 0).unwrap();
+        }
+        a.rebuild();
+        assert!(!a.index_used(), "1000 条应走二分");
+        for i in 1000..3000i64 {
+            a.insert(i * 3, 0).unwrap();
+        }
+        a.rebuild();
+        assert!(a.index_used(), "3000 条应走块索引");
+        assert_eq!(a.find_le(&4500).map(|(k, _)| *k), Some(4500));
+        assert_eq!(a.find_ge(&4501).map(|(k, _)| *k), Some(4503));
+    }
+
+    /// `binary_below` 开关（小数组跳过块索引）不影响结果。
+    #[test]
+    fn binary_below_switch_keeps_results_correct() {
+        for below in [0usize, 10, 1000, 100_000] {
+            let mut a = JumpArray::<i64, u8>::new().with_binary_below(below);
+            for i in 0..2000i64 {
+                a.insert(i * 3, 0).unwrap();
+            }
+            a.rebuild();
+            for q in [0i64, 1, 100, 2999, 3000, 6002] {
+                let keys: Vec<i64> = (0..2000).map(|i| i * 3).collect();
+                let le = keys.partition_point(|x| *x <= q);
+                assert_eq!(
+                    a.find_le(&q).map(|(k, _)| *k),
+                    (le > 0).then(|| keys[le - 1]),
+                    "below={below} find_le {q}"
+                );
+                let ge = keys.partition_point(|x| *x < q);
+                assert_eq!(
+                    a.find_ge(&q).map(|(k, _)| *k),
+                    keys.get(ge).copied(),
+                    "below={below} find_ge {q}"
+                );
+            }
+            let got: Vec<i64> = a.range(100, 900).map(|(k, _)| *k).collect();
+            assert_eq!(got, (34..=300).map(|i| i * 3).collect::<Vec<_>>());
+        }
+    }
+
+    /// `width_scale` 不影响正确性（只改块表大小与块内扫长度）。
     #[test]
     fn width_scale_keeps_results_correct() {
         let keys: Vec<i64> = (0..2000i64)

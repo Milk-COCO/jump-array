@@ -821,6 +821,54 @@ fn main() {
     println!("\n## 块宽倍数扫描 n = {n}（scale=1 是平均每块一个元素）");
     width_scale_sweep(n, "稀疏均匀", sparse, win);
     width_scale_sweep(n, "聚簇    ", clustered, win);
+
+    // ⑥ 小数组二分阈值：数组整体在 L1 时，二分能否打过块索引。
+    println!("\n## 小数组二分阈值扫描 n = {n}（0=总用块索引）");
+    binary_below_sweep(n, "稀疏均匀", sparse, win);
+    binary_below_sweep(n, "聚簇    ", clustered, win);
+}
+
+/// 扫描"元素数 ≤ 阈值就用二分"的拐点。
+fn binary_below_sweep(n: usize, label: &str, key: impl Fn(usize) -> i64 + Copy, win: usize) {
+    let wins = (n / win).max(1);
+    let probes = 100_000usize.min(n.saturating_mul(10)).max(1_000);
+    let mut rng = Rng(0x1234_5678_9abc_def0);
+    let qs: Vec<i64> = (0..probes)
+        .map(|_| rng.below((n as u64) * 997 * 2) as i64)
+        .collect();
+    for below in [0usize, 128, 256, 512, 1024, 2048, 8192] {
+        let mut a = JumpArray::<i64, u32>::new().with_binary_below(below);
+        for i in 0..n {
+            a.insert(key(i), i as u32).ok();
+        }
+        a.rebuild();
+        let rand = bench(|| {
+            let mut acc = 0i64;
+            for q in &qs {
+                if let Some((k, _)) = a.find_le(q) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+            black_box(acc);
+        }) * 1e9
+            / probes as f64;
+        let wincur = bench(|| {
+            let mut cur = a.cursor();
+            let mut acc = 0i64;
+            for w in 0..wins {
+                let lo = key(w * win);
+                let hi = key(((w + 1) * win).min(n - 1));
+                for (k, _) in a.range_from(&mut cur, lo, hi) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+            black_box(acc);
+        }) * 1e9
+            / wins as f64;
+        println!(
+            "  {label} binary_below {below:>6} | rand {rand:>6.1}ns | win-cur {wincur:>6.1}ns"
+        );
+    }
 }
 
 fn width_scale_sweep(n: usize, label: &str, key: impl Fn(usize) -> i64 + Copy, win: usize) {
