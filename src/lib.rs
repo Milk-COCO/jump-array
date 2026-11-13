@@ -48,6 +48,9 @@
 
 use std::cmp::Ordering;
 
+pub mod soa;
+pub use soa::JumpArraySoA;
+
 /// 有序键：全序比较 + 数值化（块下标计算用）。
 pub trait Key: Copy + std::fmt::Debug {
     fn cmp_key(&self, other: &Self) -> Ordering;

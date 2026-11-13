@@ -11,7 +11,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use jump_array::JumpArray;
+use jump_array::{JumpArray, JumpArraySoA};
 
 /// 参与对比的两种实现。
 trait Store {
@@ -200,6 +200,39 @@ impl<const LM: usize> Store for JumpTuned<LM> {
             64 => "jump-lm64",
             _ => "jump-lm?",
         }
+    }
+}
+
+struct JumpSoa(JumpArraySoA<i64, u32>);
+
+impl Store for JumpSoa {
+    fn new() -> Self {
+        Self(JumpArraySoA::new())
+    }
+    fn insert(&mut self, k: i64, v: u32) -> Result<(), u32> {
+        self.0.insert(k, v)
+    }
+    fn remove(&mut self, k: &i64) -> Option<u32> {
+        self.0.remove(k)
+    }
+    fn find_le(&self, k: &i64) -> Option<(&i64, &u32)> {
+        self.0.find_le(k)
+    }
+    fn iter_all<'a>(&'a self) -> Box<dyn Iterator<Item = (&'a i64, &'a u32)> + 'a> {
+        Box::new(self.0.iter())
+    }
+    fn range<'a>(&'a self, lo: i64, hi: i64) -> Box<dyn Iterator<Item = (&'a i64, &'a u32)> + 'a> {
+        Box::new(self.0.range(lo, hi))
+    }
+    fn mem_bytes(&self) -> usize {
+        let (blocks, len, _) = self.0.stats();
+        len * (std::mem::size_of::<i64>() + std::mem::size_of::<u32>()) + blocks * 4
+    }
+    fn finalize(&mut self) {
+        self.0.rebuild();
+    }
+    fn label() -> &'static str {
+        "jump-SoA"
     }
 }
 
@@ -601,6 +634,117 @@ fn print_pair<A: Store, B: Store, F: Fn(usize) -> i64 + Copy>(n: usize, key: F, 
     );
 }
 
+/// 只对比读指标：AoS(`Jump`) vs SoA(`JumpSoa`)，同轮交替。
+fn print_pair_soa<F: Fn(usize) -> i64 + Copy>(n: usize, key: F, win: usize) {
+    let a = prep::<Jump, _>(n, key, win);
+    let b = prep::<JumpSoa, _>(n, key, win);
+    let probes = a.qs.len() as f64;
+    let wins = a.wins as f64;
+
+    let (rand_a, rand_b) = paired(
+        &a.store,
+        &b.store,
+        |s| {
+            let mut acc = 0i64;
+            for q in &a.qs {
+                if let Some((k, _)) = s.find_le(q) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+            black_box(acc);
+        },
+        |s| {
+            let mut acc = 0i64;
+            for q in &b.qs {
+                if let Some((k, _)) = s.find_le(q) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+            black_box(acc);
+        },
+    );
+    let (seq_a, seq_b) = paired(
+        &a.store,
+        &b.store,
+        |s| {
+            let mut acc = 0i64;
+            for i in 0..n {
+                if let Some((k, _)) = s.find_le(&key(i)) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+            black_box(acc);
+        },
+        |s| {
+            let mut acc = 0i64;
+            for i in 0..n {
+                if let Some((k, _)) = s.find_le(&key(i)) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+            black_box(acc);
+        },
+    );
+    let (iter_a, iter_b) = paired(
+        &a.store,
+        &b.store,
+        |s| {
+            let mut acc = 0u64;
+            for (k, v) in s.iter_all() {
+                acc = acc.wrapping_add(*k as u64).wrapping_add(*v as u64);
+            }
+            black_box(acc);
+        },
+        |s| {
+            let mut acc = 0u64;
+            for (k, v) in s.iter_all() {
+                acc = acc.wrapping_add(*k as u64).wrapping_add(*v as u64);
+            }
+            black_box(acc);
+        },
+    );
+    let (win_a, win_b) = paired(
+        &a.store,
+        &b.store,
+        |s| {
+            let mut acc = 0i64;
+            for w in 0..a.wins {
+                let lo = key(w * win);
+                let hi = key(((w + 1) * win).min(n - 1));
+                for (k, _) in s.range(lo, hi) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+            black_box(acc);
+        },
+        |s| {
+            let mut acc = 0i64;
+            for w in 0..b.wins {
+                let lo = key(w * win);
+                let hi = key(((w + 1) * win).min(n - 1));
+                for (k, _) in s.range(lo, hi) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+            black_box(acc);
+        },
+    );
+    println!(
+        "  AoS   rand {:>6.1}ns seq {:>5.1}ns iter {:>5.2}ns/e win {:>6.1}ns",
+        rand_a * 1e9 / probes,
+        seq_a * 1e9 / n as f64,
+        iter_a * 1e9 / n as f64,
+        win_a * 1e9 / wins
+    );
+    println!(
+        "  SoA   rand {:>6.1}ns seq {:>5.1}ns iter {:>5.2}ns/e win {:>6.1}ns",
+        rand_b * 1e9 / probes,
+        seq_b * 1e9 / n as f64,
+        iter_b * 1e9 / n as f64,
+        win_b * 1e9 / wins
+    );
+}
+
 struct Metrics {
     build_ms: f64,
     mem_mb: f64,
@@ -841,6 +985,12 @@ fn main() {
     println!("\n## 小数组二分阈值扫描 n = {n}（0=总用块索引）");
     binary_below_sweep(n, "稀疏均匀", sparse, win);
     binary_below_sweep(n, "聚簇    ", clustered, win);
+
+    // ⑦ AoS（键值同条）vs SoA（键值分数组）：只看读指标。
+    println!("\n## AoS vs SoA n = {n}  稀疏均匀");
+    print_pair_soa(n, sparse, win);
+    println!("## AoS vs SoA n = {n}  聚簇");
+    print_pair_soa(n, clustered, win);
 }
 
 /// 扫描"元素数 ≤ 阈值就用二分"的拐点。
