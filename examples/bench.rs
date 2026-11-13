@@ -25,11 +25,11 @@ trait Store {
     fn range<'a>(&'a self, lo: i64, hi: i64) -> Box<dyn Iterator<Item = (&'a i64, &'a u32)> + 'a>;
     fn mem_bytes(&self) -> usize;
     /// 顺序滑窗求和（用 `range` 的无状态实现；有游标的实现覆盖它）。
-    fn window_sum(&self, key: &dyn Fn(usize) -> i64, wins: usize, n: usize) -> i64 {
+    fn window_sum(&self, key: &dyn Fn(usize) -> i64, wins: usize, n: usize, win: usize) -> i64 {
         let mut acc = 0i64;
         for w in 0..wins {
-            let lo = key(w * 64);
-            let hi = key(((w + 1) * 64).min(n - 1));
+            let lo = key(w * win);
+            let hi = key(((w + 1) * win).min(n - 1));
             for (k, _) in self.range(lo, hi) {
                 acc = acc.wrapping_add(*k);
             }
@@ -115,12 +115,12 @@ impl Store for Jump {
         let (blocks, len, _) = self.0.stats();
         len * std::mem::size_of::<(i64, u32)>() + blocks * 4
     }
-    fn window_sum(&self, key: &dyn Fn(usize) -> i64, wins: usize, n: usize) -> i64 {
+    fn window_sum(&self, key: &dyn Fn(usize) -> i64, wins: usize, n: usize, win: usize) -> i64 {
         let mut cur = self.0.cursor();
         let mut acc = 0i64;
         for w in 0..wins {
-            let lo = key(w * 64);
-            let hi = key(((w + 1) * 64).min(n - 1));
+            let lo = key(w * win);
+            let hi = key(((w + 1) * win).min(n - 1));
             for (k, _) in self.0.range_from(&mut cur, lo, hi) {
                 acc = acc.wrapping_add(*k);
             }
@@ -240,7 +240,7 @@ struct Metrics {
     del_ns: f64,
 }
 
-fn measure<S: Store>(n: usize, key: impl Fn(usize) -> i64) -> Metrics {
+fn measure<S: Store>(n: usize, key: impl Fn(usize) -> i64, win: usize) -> Metrics {
     let build_ms = bench(|| {
         let mut s = S::new();
         for i in 0..n {
@@ -293,12 +293,12 @@ fn measure<S: Store>(n: usize, key: impl Fn(usize) -> i64) -> Metrics {
     }) * 1e9
         / n as f64;
 
-    let wins = (n / 64).max(1);
+    let wins = (n / win).max(1);
     let win_ns = bench(|| {
         let mut acc = 0i64;
         for w in 0..wins {
-            let lo = key(w * 64);
-            let hi = key(((w + 1) * 64).min(n - 1));
+            let lo = key(w * win);
+            let hi = key(((w + 1) * win).min(n - 1));
             for (k, _) in store.range(lo, hi) {
                 acc = acc.wrapping_add(*k);
             }
@@ -309,7 +309,7 @@ fn measure<S: Store>(n: usize, key: impl Fn(usize) -> i64) -> Metrics {
 
     // 顺序滑窗（有游标的实现走 `range_from`，其余等价于上面的 range）。
     let wincur_ns = bench(|| {
-        black_box(store.window_sum(&key, wins, n));
+        black_box(store.window_sum(&key, wins, n, win));
     }) * 1e9
         / wins as f64;
 
@@ -357,8 +357,8 @@ fn measure<S: Store>(n: usize, key: impl Fn(usize) -> i64) -> Metrics {
     }
 }
 
-fn print_row<S: Store, F: Fn(usize) -> i64 + Copy>(n: usize, key: F) {
-    let m = measure::<S>(n, key);
+fn print_row<S: Store, F: Fn(usize) -> i64 + Copy>(n: usize, key: F, win: usize) {
+    let m = measure::<S>(n, key, win);
     println!(
         "  {:<10} build {:>8.2}ms | mem {:>5.2}MB | find_le rand {:>6.1}ns seq {:>5.1}ns | iter {:>5.2}ns/e | win {:>6.1}ns | win-cur {:>6.1}ns | ins {:>9.1}ns | del {:>9.1}ns",
         S::label(),
@@ -375,11 +375,24 @@ fn print_row<S: Store, F: Fn(usize) -> i64 + Copy>(n: usize, key: F) {
 }
 
 fn main() {
-    let max_n = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(100_000);
-    println!("# JumpArray vs Vec+二分（5 轮最小值）");
+    let mut max_n = 100_000usize;
+    let mut win = 64usize;
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--win" => {
+                win = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .expect("--win 需要数字");
+            }
+            other => {
+                max_n = other.parse().expect("位置参数是最大规模 n");
+            }
+        }
+    }
+    win = win.max(1);
+    println!("# JumpArray vs Vec+二分（probe 过滤 + 中位数，窗口 {win} 元素）");
     for n in [1_000usize, 10_000, 100_000, 1_000_000] {
         if n > max_n {
             break;
@@ -387,14 +400,14 @@ fn main() {
         // ① 稀疏均匀：步长 997（键域远大于元素数）。
         println!("\n## n = {n}  稀疏均匀（step=997）");
         let sparse = |i: usize| (i as i64) * 997;
-        print_row::<VecSorted, _>(n, sparse);
-        print_row::<Jump, _>(n, sparse);
+        print_row::<VecSorted, _>(n, sparse, win);
+        print_row::<Jump, _>(n, sparse, win);
 
         // ② 聚簇：每组 100 个键密集排布（间距 1），组间跳 100_000。
         println!("## n = {n}  聚簇（100 键/组，组间跳 100_000）");
         let clustered = |i: usize| ((i / 100) as i64) * 100_000 + (i % 100) as i64;
-        print_row::<VecSorted, _>(n, clustered);
-        print_row::<Jump, _>(n, clustered);
+        print_row::<VecSorted, _>(n, clustered, win);
+        print_row::<Jump, _>(n, clustered, win);
     }
 
     // ③ 阈值扫描：同一个 JumpArray，只改"块内线性扫上限"，看查询/窗口的拐点。
@@ -402,35 +415,33 @@ fn main() {
     let sparse = |i: usize| (i as i64) * 997;
     let clustered = |i: usize| ((i / 100) as i64) * 100_000 + (i % 100) as i64;
     println!("\n## 阈值扫描 n = {n}  稀疏均匀");
-    print_row::<JumpTuned<1>, _>(n, sparse);
-    print_row::<JumpTuned<2>, _>(n, sparse);
-    print_row::<JumpTuned<4>, _>(n, sparse);
-    print_row::<JumpTuned<8>, _>(n, sparse);
-    print_row::<JumpTuned<16>, _>(n, sparse);
-    print_row::<JumpTuned<32>, _>(n, sparse);
-    print_row::<JumpTuned<64>, _>(n, sparse);
+    print_row::<JumpTuned<1>, _>(n, sparse, win);
+    print_row::<JumpTuned<2>, _>(n, sparse, win);
+    print_row::<JumpTuned<4>, _>(n, sparse, win);
+    print_row::<JumpTuned<8>, _>(n, sparse, win);
+    print_row::<JumpTuned<16>, _>(n, sparse, win);
+    print_row::<JumpTuned<32>, _>(n, sparse, win);
+    print_row::<JumpTuned<64>, _>(n, sparse, win);
     println!("\n## 阈值扫描 n = {n}  聚簇");
-    print_row::<JumpTuned<1>, _>(n, clustered);
-    print_row::<JumpTuned<2>, _>(n, clustered);
-    print_row::<JumpTuned<4>, _>(n, clustered);
-    print_row::<JumpTuned<8>, _>(n, clustered);
-    print_row::<JumpTuned<16>, _>(n, clustered);
-    print_row::<JumpTuned<32>, _>(n, clustered);
-    print_row::<JumpTuned<64>, _>(n, clustered);
+    print_row::<JumpTuned<1>, _>(n, clustered, win);
+    print_row::<JumpTuned<2>, _>(n, clustered, win);
+    print_row::<JumpTuned<4>, _>(n, clustered, win);
+    print_row::<JumpTuned<8>, _>(n, clustered, win);
+    print_row::<JumpTuned<16>, _>(n, clustered, win);
+    print_row::<JumpTuned<32>, _>(n, clustered, win);
+    print_row::<JumpTuned<64>, _>(n, clustered, win);
 
     // ④ 拆解窗口成本：定位（pos）/ 迭代（iter）/ 合计（full），ns/窗口。
-    println!("\n## 窗口拆解 n = {n}（ns/窗口：pos=只定位 iter=只迭代 full=合计）");
-    window_split(n, "稀疏均匀", sparse);
-    window_split(n, "聚簇    ", clustered);
+    println!(
+        "\n## 窗口拆解 n = {n}（窗口 {win}；ns/窗口：pos=只定位 iter=只迭代 full=合计）"
+    );
+    window_split(n, "稀疏均匀", sparse, win);
+    window_split(n, "聚簇    ", clustered, win);
 }
 
-/// 把"定位"和"迭代"分开计时：两边都按同样的 64 元素窗口序列。
-fn window_split(
-    n: usize,
-    label: &str,
-    key: impl Fn(usize) -> i64 + Copy,
-) {
-    let wins = (n / 64).max(1);
+/// 把"定位"和"迭代"分开计时：两边都按同样的 `win` 元素窗口序列。
+fn window_split(n: usize, label: &str, key: impl Fn(usize) -> i64 + Copy, win: usize) {
+    let wins = (n / win).max(1);
     let mut j = JumpArray::<i64, u32>::new();
     let mut v: Vec<(i64, u32)> = Vec::with_capacity(n);
     for i in 0..n {
@@ -444,8 +455,8 @@ fn window_split(
     let mut cur = j.cursor();
     let mut spans = Vec::with_capacity(wins);
     for w in 0..wins {
-        let lo = key(w * 64);
-        let hi = key(((w + 1) * 64).min(n - 1));
+        let lo = key(w * win);
+        let hi = key(((w + 1) * win).min(n - 1));
         spans.push(j.range_from(&mut cur, lo, hi).span());
     }
 
@@ -453,8 +464,8 @@ fn window_split(
         let mut cur = j.cursor();
         let mut acc = 0usize;
         for w in 0..wins {
-            let lo = key(w * 64);
-            let hi = key(((w + 1) * 64).min(n - 1));
+            let lo = key(w * win);
+            let hi = key(((w + 1) * win).min(n - 1));
             let (a, b) = j.range_from(&mut cur, lo, hi).span();
             acc = acc.wrapping_add(a ^ b);
         }
@@ -475,8 +486,8 @@ fn window_split(
         let mut cur = j.cursor();
         let mut acc = 0i64;
         for w in 0..wins {
-            let lo = key(w * 64);
-            let hi = key(((w + 1) * 64).min(n - 1));
+            let lo = key(w * win);
+            let hi = key(((w + 1) * win).min(n - 1));
             for (k, _) in j.range_from(&mut cur, lo, hi) {
                 acc = acc.wrapping_add(*k);
             }
@@ -488,8 +499,8 @@ fn window_split(
     // Vec：同样拆两半。
     let mut vspans = Vec::with_capacity(wins);
     for w in 0..wins {
-        let lo = key(w * 64);
-        let hi = key(((w + 1) * 64).min(n - 1));
+        let lo = key(w * win);
+        let hi = key(((w + 1) * win).min(n - 1));
         vspans.push((
             v.partition_point(|(x, _)| *x < lo),
             v.partition_point(|(x, _)| *x <= hi),
@@ -498,8 +509,8 @@ fn window_split(
     let pos_v = bench(|| {
         let mut acc = 0usize;
         for w in 0..wins {
-            let lo = key(w * 64);
-            let hi = key(((w + 1) * 64).min(n - 1));
+            let lo = key(w * win);
+            let hi = key(((w + 1) * win).min(n - 1));
             let a = v.partition_point(|(x, _)| *x < lo);
             let b = v.partition_point(|(x, _)| *x <= hi);
             acc = acc.wrapping_add(a ^ b);
@@ -520,8 +531,8 @@ fn window_split(
     let full_v = bench(|| {
         let mut acc = 0i64;
         for w in 0..wins {
-            let lo = key(w * 64);
-            let hi = key(((w + 1) * 64).min(n - 1));
+            let lo = key(w * win);
+            let hi = key(((w + 1) * win).min(n - 1));
             let a = v.partition_point(|(x, _)| *x < lo);
             let b = v.partition_point(|(x, _)| *x <= hi);
             for (k, _) in &v[a..b] {
