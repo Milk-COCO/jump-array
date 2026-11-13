@@ -94,7 +94,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone, Copy)]
 pub struct Cursor {
     id: u64,
-    version: u32,
+    version: u64,
     pos: usize,
 }
 
@@ -107,9 +107,8 @@ impl Cursor {
 
 /// 有序容器（key 唯一、按 key 升序）。
 ///
-/// ⚠️ **刻意不实现 `Clone`**：游标用 `id` 识别实例，克隆副本若沿用同一个 `id`，
-/// 旧游标会在副本上"看似有效"却指向不同数据。若将来要加 `Clone`，必须给新副本
-/// 分配新的 `id`。
+/// `Clone` 复制内容并把 `id` 换成新实例：克隆副本与原件是**两个独立实例**，
+/// 各自的游标不能跨用（会退回冷路径），这是有意为之。
 pub struct JumpArray<K: Key, E> {
     keys: Vec<K>,
     vals: Vec<E>,
@@ -132,12 +131,51 @@ pub struct JumpArray<K: Key, E> {
     minor_anchors: bool,
     id: u64,
     /// 写入代数：`insert`/`remove` +1；`rebuild` 不改下标，故不变。
-    version: u32,
+    version: u64,
 }
 
 impl<K: Key, E> Default for JumpArray<K, E> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<K: Key, E: Clone> Clone for JumpArray<K, E> {
+    /// 克隆内容，但**分配新的实例 id**：副本与原件是两个独立实例。
+    ///
+    /// `version`（写入代数）随内容一起复制；副本自己的游标照常工作，原件的游标在
+    /// 副本上会因 `id` 不匹配而退回冷路径。
+    fn clone(&self) -> Self {
+        Self {
+            keys: self.keys.clone(),
+            vals: self.vals.clone(),
+            blocks: self.blocks.clone(),
+            minor_base: self.minor_base.clone(),
+            minor: self.minor.clone(),
+            base: self.base,
+            width: self.width,
+            inv_width: self.inv_width,
+            dirty: self.dirty,
+            linear_max: self.linear_max,
+            binary_below: self.binary_below,
+            span_scan_max: self.span_scan_max,
+            minor_anchors: self.minor_anchors,
+            id: NEXT_ID.fetch_add(1, AtomicOrdering::Relaxed),
+            version: self.version,
+        }
+    }
+}
+
+/// 摘要形式：不打印元素内容，也不要求 `E: Debug`。
+impl<K: Key, E> std::fmt::Debug for JumpArray<K, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JumpArray")
+            .field("len", &self.keys.len())
+            .field("blocks", &self.blocks.len())
+            .field("minor", &self.minor.len())
+            .field("dirty", &self.dirty)
+            .field("width", &self.width)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1039,6 +1077,53 @@ mod tests {
             let got = a.find_ge_from(&mut cur, &q).map(|(k, _)| *k);
             assert_eq!(got, want, "ge {q}");
         }
+    }
+
+    /// 克隆 = 新实例：内容一致，游标不能跨用（退回冷路径，结果正确）。
+    #[test]
+    fn clone_is_an_independent_instance() {
+        let mut a = JumpArray::<i64, u8>::new();
+        for i in 0..3000i64 {
+            a.insert(i * 3, 0).unwrap();
+        }
+        a.rebuild();
+        let mut cur = a.cursor();
+        assert_eq!(a.find_le_from(&mut cur, &100).map(|(k, _)| *k), Some(99));
+
+        let b = a.clone();
+        assert_eq!(b.len(), 3000);
+        // 旧游标在副本上：id 不匹配 ⇒ 冷路径，结果仍正确
+        assert_eq!(b.find_le_from(&mut cur, &100).map(|(k, _)| *k), Some(99));
+        assert_eq!(b.find_ge_from(&mut cur, &100).map(|(k, _)| *k), Some(102));
+        // 副本自己的游标照常工作
+        let mut cur_b = b.cursor();
+        assert_eq!(b.find_le_from(&mut cur_b, &100).map(|(k, _)| *k), Some(99));
+        assert_eq!(
+            a.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            b.iter().map(|(k, _)| *k).collect::<Vec<_>>()
+        );
+        // Debug 是摘要（不含元素内容）
+        let d = format!("{b:?}");
+        assert!(d.contains("JumpArray"), "debug={d}");
+        assert!(d.contains("len: 3000"), "debug={d}");
+    }
+
+    /// 脏状态下克隆：两边都保持脏、查询都正确。
+    #[test]
+    fn clone_preserves_dirty_state() {
+        let mut a = JumpArray::<i64, u8>::new();
+        for i in 0..500i64 {
+            a.insert(i * 2, 0).unwrap();
+        }
+        assert!(a.is_dirty());
+        let b = a.clone();
+        assert!(b.is_dirty());
+        assert_eq!(b.find_le(&500).map(|(k, _)| *k), Some(500));
+        a.rebuild();
+        let mut c = a.clone();
+        c.rebuild();
+        assert!(!c.is_dirty());
+        assert_eq!(c.find_le(&500).map(|(k, _)| *k), Some(500));
     }
 
     /// 跨实例的游标：id 不匹配 ⇒ 冷路径，结果正确。
