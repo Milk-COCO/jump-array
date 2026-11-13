@@ -194,29 +194,61 @@ impl<K: Key, E> JumpArray<K, E> {
             .partition_point(|(x, _)| x.cmp_key(k) != Ordering::Greater)
     }
 
-    /// 索引起跳 + 块内短扫。
+    /// 块内元素数 ≤ 它时用线性扫，超过则改成块内二分（聚簇兜底）。
+    const LINEAR_MAX: usize = 8;
+
+    /// 块表给出的 `[start, end)`：该块覆盖的元素下标区间。
+    ///
+    /// 空块时 `start == end`（两个锚点相同）。返回 `(start, end)`。
+    #[inline]
+    fn block_span(&self, b: usize) -> (usize, usize) {
+        let start = self.blocks[b] as usize;
+        let end = if b + 1 < self.blocks.len() {
+            self.blocks[b + 1] as usize
+        } else {
+            self.entries.len()
+        };
+        (start, end)
+    }
+
+    /// 索引起跳 + 块内短扫（块内元素多则二分）。
     #[inline]
     fn lower_bound_fast(&self, k: &K) -> usize {
         if self.dirty || self.blocks.is_empty() {
             return self.lower_bound(k);
         }
-        let mut i = self.blocks[self.block_of(k)] as usize;
-        while i < self.entries.len() && self.entries[i].0.cmp_key(k) == Ordering::Less {
-            i += 1;
+        let (start, end) = self.block_span(self.block_of(k));
+        if end - start <= Self::LINEAR_MAX {
+            let mut i = start;
+            while i < end && self.entries[i].0.cmp_key(k) == Ordering::Less {
+                i += 1;
+            }
+            i
+        } else {
+            start
+                + self.entries[start..end]
+                    .partition_point(|(x, _)| x.cmp_key(k) == Ordering::Less)
         }
-        i
     }
 
+    /// 同上，取"第一个 `key > k`"。
     #[inline]
     fn upper_bound_fast(&self, k: &K) -> usize {
         if self.dirty || self.blocks.is_empty() {
             return self.upper_bound(k);
         }
-        let mut i = self.blocks[self.block_of(k)] as usize;
-        while i < self.entries.len() && self.entries[i].0.cmp_key(k) != Ordering::Greater {
-            i += 1;
+        let (start, end) = self.block_span(self.block_of(k));
+        if end - start <= Self::LINEAR_MAX {
+            let mut i = start;
+            while i < end && self.entries[i].0.cmp_key(k) != Ordering::Greater {
+                i += 1;
+            }
+            i
+        } else {
+            start
+                + self.entries[start..end]
+                    .partition_point(|(x, _)| x.cmp_key(k) != Ordering::Greater)
         }
-        i
     }
 
     /// 插入；key 已存在时返回 `Err(value)`。写入后需 `rebuild` 才恢复 O(1) 查询。
@@ -435,6 +467,46 @@ mod tests {
         let (blocks, len, _) = a.stats();
         assert!(blocks <= 40_000, "块表 {blocks} 应 ≈ 元素数 {len}");
         assert_eq!(a.find_le(&500_000.5).map(|(k, _)| *k), Some(500_000.0));
+    }
+
+    /// 聚簇数据：块内元素数超过 `LINEAR_MAX` 时走块内二分，结果仍与模型一致。
+    #[test]
+    fn handles_clustered_keys() {
+        // 每组 100 个键密集排布（间距 1），组间跳 100_000 —— 典型的"块内堆积"。
+        let mut a = JumpArray::<i64, u8>::new();
+        let mut model: Vec<i64> = Vec::new();
+        for i in 0..3000i64 {
+            let k = (i / 100) * 100_000 + (i % 100);
+            a.insert(k, 0).unwrap();
+            model.push(k);
+        }
+        a.rebuild();
+        let (blocks, len, _) = a.stats();
+        assert_eq!(len, 3000);
+        assert!(blocks <= 4000);
+        for q in (-1..30).map(|i| i * 10_000) {
+            let want = model.partition_point(|x| *x <= q);
+            assert_eq!(
+                a.find_le(&q).map(|(k, _)| *k),
+                (want > 0).then(|| model[want - 1]),
+                "find_le {q}"
+            );
+            let want_ge = model.partition_point(|x| *x < q);
+            assert_eq!(
+                a.find_ge(&q).map(|(k, _)| *k),
+                model.get(want_ge).copied(),
+                "find_ge {q}"
+            );
+        }
+        // 逐个键验证（密集区内也走二分分支）。
+        for k in &model {
+            assert_eq!(a.find_le(k).map(|(x, _)| *x), Some(*k), "find_le {k}");
+            assert_eq!(
+                a.find_ge(k).map(|(x, _)| *x),
+                Some(*k),
+                "find_ge exact {k}"
+            );
+        }
     }
 
     /// `rebuild` 幂等：干净时重复调用不改任何状态（尤其不重复扫描）。

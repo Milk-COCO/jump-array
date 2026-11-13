@@ -278,15 +278,21 @@ fn main() {
         .nth(1)
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(100_000);
-    // 稀疏键：步长 997，模拟"键域远大于元素数"。
-    let key = |i: usize| (i as i64) * 997;
-    println!("# JumpArray vs Vec+二分（5 轮最小值，稀疏键 step=997）");
+    println!("# JumpArray vs Vec+二分（5 轮最小值）");
     for n in [1_000usize, 10_000, 100_000, 1_000_000] {
         if n > max_n {
             break;
         }
-        println!("\n## n = {n}");
-        print_row::<VecSorted, _>(n, key);
-        print_row::<Jump, _>(n, key);
+        // ① 稀疏均匀：步长 997（键域远大于元素数）。
+        println!("\n## n = {n}  稀疏均匀（step=997）");
+        let sparse = |i: usize| (i as i64) * 997;
+        print_row::<VecSorted, _>(n, sparse);
+        print_row::<Jump, _>(n, sparse);
+
+        // ② 聚簇：每组 100 个键密集排布（间距 1），组间跳 100_000。
+        println!("## n = {n}  聚簇（100 键/组，组间跳 100_000）");
+        let clustered = |i: usize| ((i / 100) as i64) * 100_000 + (i % 100) as i64;
+        print_row::<VecSorted, _>(n, clustered);
+        print_row::<Jump, _>(n, clustered);
     }
 }
