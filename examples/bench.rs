@@ -687,7 +687,7 @@ fn print_pair<A: Store, B: Store, F: Fn(usize) -> i64 + Copy>(n: usize, key: F, 
 }
 
 /// 只对比读指标：带二级锚 vs 不带（同一实现），同轮交替。
-fn print_pair_soa<F: Fn(usize) -> i64 + Copy>(n: usize, key: F, win: usize) {
+fn print_pair_minor<F: Fn(usize) -> i64 + Copy>(n: usize, key: F, win: usize) {
     let a = prep::<JumpMinor, _>(n, key, win);
     let b = prep::<JumpNoMinor, _>(n, key, win);
     let probes = a.qs.len() as f64;
@@ -990,9 +990,9 @@ fn main() {
         dirty_strategy(max_n, "聚簇    ", clustered);
         println!("\n## 二级锚 A/B");
         println!("  稀疏均匀");
-        print_pair_soa(max_n, sparse, win);
+        print_pair_minor(max_n, sparse, win);
         println!("  聚簇    ");
-        print_pair_soa(max_n, clustered, win);
+        print_pair_minor(max_n, clustered, win);
         return;
     }
     println!("# JumpArray vs Vec+二分（probe 过滤 + 中位数，窗口 {win} 元素）");
@@ -1042,9 +1042,9 @@ fn main() {
     // ⑤ 二级锚：密集块再切 8 格（1 次加载 + 短扫）vs 块内二分。
     println!("\n## 二级锚 A/B n = {n}（minor = 带锚，nomino = 不带）");
     println!("  稀疏均匀");
-    print_pair_soa(n, sparse, win);
+    print_pair_minor(n, sparse, win);
     println!("  聚簇    ");
-    print_pair_soa(n, clustered, win);
+    print_pair_minor(n, clustered, win);
 
     // ⑥ 小数组二分阈值：数组整体在 L1 时，二分能否打过块索引。
     println!("\n## 小数组二分阈值扫描 n = {n}（0=总用块索引）");
