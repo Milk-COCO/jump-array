@@ -73,7 +73,12 @@ pub struct JumpArray<K: Key, E> {
     width: f64,
     /// 索引过期（写入后置脏，`rebuild` 清除）。
     dirty: bool,
+    /// 块内元素数不超过它时线性扫，超过则块内二分（可调）。
+    linear_max: usize,
 }
+
+/// `linear_max` 默认值。
+const DEFAULT_LINEAR_MAX: usize = 8;
 
 impl<K: Key, E> Default for JumpArray<K, E> {
     fn default() -> Self {
@@ -89,7 +94,14 @@ impl<K: Key, E> JumpArray<K, E> {
             base: 0.0,
             width: 1.0,
             dirty: true,
+            linear_max: DEFAULT_LINEAR_MAX,
         }
+    }
+
+    /// 调整"块内线性扫"阈值（块内元素数超过它则块内二分）。
+    pub fn with_linear_max(mut self, linear_max: usize) -> Self {
+        self.linear_max = linear_max.max(1);
+        self
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
@@ -194,12 +206,9 @@ impl<K: Key, E> JumpArray<K, E> {
             .partition_point(|(x, _)| x.cmp_key(k) != Ordering::Greater)
     }
 
-    /// 块内元素数 ≤ 它时用线性扫，超过则改成块内二分（聚簇兜底）。
-    const LINEAR_MAX: usize = 8;
-
     /// 块表给出的 `[start, end)`：该块覆盖的元素下标区间。
     ///
-    /// 空块时 `start == end`（两个锚点相同）。返回 `(start, end)`。
+    /// 空块时 `start == end`（两个锚点相同）。
     #[inline]
     fn block_span(&self, b: usize) -> (usize, usize) {
         let start = self.blocks[b] as usize;
@@ -218,7 +227,7 @@ impl<K: Key, E> JumpArray<K, E> {
             return self.lower_bound(k);
         }
         let (start, end) = self.block_span(self.block_of(k));
-        if end - start <= Self::LINEAR_MAX {
+        if end - start <= self.linear_max {
             let mut i = start;
             while i < end && self.entries[i].0.cmp_key(k) == Ordering::Less {
                 i += 1;
@@ -238,7 +247,7 @@ impl<K: Key, E> JumpArray<K, E> {
             return self.upper_bound(k);
         }
         let (start, end) = self.block_span(self.block_of(k));
-        if end - start <= Self::LINEAR_MAX {
+        if end - start <= self.linear_max {
             let mut i = start;
             while i < end && self.entries[i].0.cmp_key(k) != Ordering::Greater {
                 i += 1;
@@ -318,12 +327,23 @@ impl<K: Key, E> JumpArray<K, E> {
     }
 
     /// `[lo, hi]` 区间（含两端、升序、连续切片）。
+    ///
+    /// 上界优先从 `from` **向前线性探**（窗口小的时候最便宜）；探到扫描上限还没
+    /// 越过 `hi` 才回退到 `upper_bound_fast`（块内二分/二分）。
     pub fn range(&self, lo: K, hi: K) -> RangeIter<'_, K, E> {
         if self.is_empty() || lo.cmp_key(&hi) == Ordering::Greater {
             return RangeIter { slice: &[] };
         }
         let from = self.lower_bound_fast(&lo);
-        let to = self.upper_bound_fast(&hi).max(from);
+        let n = self.entries.len();
+        let cap = (self.linear_max * 8).max(64);
+        let mut to = from;
+        while to < n && to - from < cap && self.entries[to].0.cmp_key(&hi) != Ordering::Greater {
+            to += 1;
+        }
+        if to - from >= cap && to < n && self.entries[to].0.cmp_key(&hi) != Ordering::Greater {
+            to = self.upper_bound_fast(&hi).max(from);
+        }
         RangeIter {
             slice: &self.entries[from..to],
         }
@@ -534,5 +554,51 @@ mod tests {
         assert_eq!(a.find_le(&-1).map(|(k, _)| *k), Some(-1), "新首键可取到");
         assert_eq!(a.find_le(&0).map(|(k, _)| *k), Some(0));
         assert!(a.find_le(&-2).is_none(), "base 已换到新首键");
+    }
+
+    /// 任意 `linear_max` 下结果一致（线性/二分两条分支都要正确）。
+    #[test]
+    fn linear_max_variants_agree() {
+        let keys: Vec<i64> = (0..2000i64)
+            .map(|i| (i / 100) * 100_000 + (i % 100))
+            .collect();
+        for lm in [1usize, 2, 8, 64] {
+            let mut a = JumpArray::<i64, u8>::new().with_linear_max(lm);
+            for k in &keys {
+                a.insert(*k, 0).unwrap();
+            }
+            a.rebuild();
+            for i in 0..300i64 {
+                let q = i * 997;
+                let le = keys.partition_point(|x| *x <= q);
+                assert_eq!(
+                    a.find_le(&q).map(|(k, _)| *k),
+                    (le > 0).then(|| keys[le - 1]),
+                    "lm={lm} find_le {q}"
+                );
+                let lt = keys.partition_point(|x| *x < q);
+                assert_eq!(
+                    a.find_ge(&q).map(|(k, _)| *k),
+                    keys.get(lt).copied(),
+                    "lm={lm} find_ge {q}"
+                );
+            }
+        }
+    }
+
+    /// 窗口大于线性探测上限时，`range` 回退到二分，结果仍完整。
+    #[test]
+    fn range_falls_back_past_probe_cap() {
+        let mut a = JumpArray::<i64, u8>::new().with_linear_max(1);
+        let keys: Vec<i64> = (0..500).map(|i| i * 10).collect();
+        for k in &keys {
+            a.insert(*k, 0).unwrap();
+        }
+        a.rebuild();
+        // 窗口覆盖 200 个元素（cap = max(1*8, 64) = 64，必然走回退）。
+        let got: Vec<i64> = a.range(0, 1990).map(|(k, _)| *k).collect();
+        assert_eq!(got, keys[..200].to_vec());
+        let got: Vec<i64> = a.range(0, 4000).map(|(k, _)| *k).collect();
+        assert_eq!(got, keys[..401].to_vec());
     }
 }

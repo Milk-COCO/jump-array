@@ -111,6 +111,48 @@ impl Store for Jump {
     }
 }
 
+struct JumpTuned<const LM: usize>(JumpArray<i64, u32>);
+
+impl<const LM: usize> Store for JumpTuned<LM> {
+    fn new() -> Self {
+        Self(JumpArray::new().with_linear_max(LM))
+    }
+    fn insert(&mut self, k: i64, v: u32) -> Result<(), u32> {
+        self.0.insert(k, v)
+    }
+    fn remove(&mut self, k: &i64) -> Option<u32> {
+        self.0.remove(k)
+    }
+    fn find_le(&self, k: &i64) -> Option<(&i64, &u32)> {
+        self.0.find_le(k)
+    }
+    fn iter_all<'a>(&'a self) -> Box<dyn Iterator<Item = (&'a i64, &'a u32)> + 'a> {
+        Box::new(self.0.iter())
+    }
+    fn range<'a>(&'a self, lo: i64, hi: i64) -> Box<dyn Iterator<Item = (&'a i64, &'a u32)> + 'a> {
+        Box::new(self.0.range(lo, hi))
+    }
+    fn mem_bytes(&self) -> usize {
+        let (blocks, len, _) = self.0.stats();
+        len * std::mem::size_of::<(i64, u32)>() + blocks * 4
+    }
+    fn finalize(&mut self) {
+        self.0.rebuild();
+    }
+    fn label() -> &'static str {
+        match LM {
+            1 => "jump-lm1",
+            2 => "jump-lm2",
+            4 => "jump-lm4",
+            8 => "jump-lm8",
+            16 => "jump-lm16",
+            32 => "jump-lm32",
+            64 => "jump-lm64",
+            _ => "jump-lm?",
+        }
+    }
+}
+
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
@@ -295,4 +337,25 @@ fn main() {
         print_row::<VecSorted, _>(n, clustered);
         print_row::<Jump, _>(n, clustered);
     }
+
+    // ③ 阈值扫描：同一个 JumpArray，只改"块内线性扫上限"，看查询/窗口的拐点。
+    let n = max_n;
+    let sparse = |i: usize| (i as i64) * 997;
+    let clustered = |i: usize| ((i / 100) as i64) * 100_000 + (i % 100) as i64;
+    println!("\n## 阈值扫描 n = {n}  稀疏均匀");
+    print_row::<JumpTuned<1>, _>(n, sparse);
+    print_row::<JumpTuned<2>, _>(n, sparse);
+    print_row::<JumpTuned<4>, _>(n, sparse);
+    print_row::<JumpTuned<8>, _>(n, sparse);
+    print_row::<JumpTuned<16>, _>(n, sparse);
+    print_row::<JumpTuned<32>, _>(n, sparse);
+    print_row::<JumpTuned<64>, _>(n, sparse);
+    println!("\n## 阈值扫描 n = {n}  聚簇");
+    print_row::<JumpTuned<1>, _>(n, clustered);
+    print_row::<JumpTuned<2>, _>(n, clustered);
+    print_row::<JumpTuned<4>, _>(n, clustered);
+    print_row::<JumpTuned<8>, _>(n, clustered);
+    print_row::<JumpTuned<16>, _>(n, clustered);
+    print_row::<JumpTuned<32>, _>(n, clustered);
+    print_row::<JumpTuned<64>, _>(n, clustered);
 }
