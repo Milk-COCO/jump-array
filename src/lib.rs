@@ -350,13 +350,13 @@ impl<K: Key, E> JumpArray<K, E> {
     /// 插入；key 已存在时返回 `Err(value)`。写入后需 `rebuild` 才恢复 O(1) 查询。
     pub fn insert(&mut self, key: K, value: E) -> Result<(), E> {
         // 追加快路径：升序导入/反序列化就是"每次都插在末尾"，省掉一次二分。
-        if let Some((last, _)) = self.entries.last() {
-            if key.cmp_key(last) == Ordering::Greater {
-                self.entries.push((key, value));
-                self.dirty = true;
-                self.version = self.version.wrapping_add(1);
-                return Ok(());
-            }
+        if let Some((last, _)) = self.entries.last()
+            && key.cmp_key(last) == Ordering::Greater
+        {
+            self.entries.push((key, value));
+            self.dirty = true;
+            self.version = self.version.wrapping_add(1);
+            return Ok(());
         }
         let pos = self.lower_bound(&key);
         if pos < self.entries.len() && self.entries[pos].0.cmp_key(&key) == Ordering::Equal {
@@ -371,13 +371,13 @@ impl<K: Key, E> JumpArray<K, E> {
     /// 删除；不存在返回 `None`。
     pub fn remove(&mut self, key: &K) -> Option<E> {
         // 删末尾的快速路径：按序清理/回滚时就是"总是删最后一个"，省掉一次二分。
-        if let Some((last, _)) = self.entries.last() {
-            if last.cmp_key(key) == Ordering::Equal {
-                let (_, v) = self.entries.pop().expect("刚判过非空");
-                self.dirty = true;
-                self.version = self.version.wrapping_add(1);
-                return Some(v);
-            }
+        if let Some((last, _)) = self.entries.last()
+            && last.cmp_key(key) == Ordering::Equal
+        {
+            let (_, v) = self.entries.pop().expect("刚判过非空");
+            self.dirty = true;
+            self.version = self.version.wrapping_add(1);
+            return Some(v);
         }
         let pos = self.lower_bound(key);
         if pos >= self.entries.len() || self.entries[pos].0.cmp_key(key) != Ordering::Equal {
@@ -653,7 +653,7 @@ impl<K: Key, E> JumpArray<K, E> {
 }
 
 fn pow2_ceil(x: f64) -> f64 {
-    if !(x > 0.0) || !x.is_finite() {
+    if !x.is_finite() || x <= 0.0 {
         return 1.0;
     }
     let e = x.log2().ceil().clamp(-60.0, 40.0);
@@ -987,10 +987,7 @@ mod tests {
             a.insert(i * 11, 0).unwrap();
         }
         a.rebuild();
-        let probes: Vec<i64> = [1, 5000, 12, 21000, 3, 15000, 21990, 7000, 0, 22000]
-            .iter()
-            .copied()
-            .collect();
+        let probes: Vec<i64> = vec![1, 5000, 12, 21000, 3, 15000, 21990, 7000, 0, 22000];
         let mut cur = a.cursor();
         for q in probes {
             assert_eq!(
