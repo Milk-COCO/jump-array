@@ -334,7 +334,7 @@ impl<K: Key, E> JumpArray<K, E> {
         if self.is_empty() || lo.cmp_key(&hi) == Ordering::Greater {
             return RangeIter { slice: &[] };
         }
-        let from = self.lower_bound_fast(&lo);
+        let from = self.range_lower_bound(&lo);
         let n = self.entries.len();
         let cap = (self.linear_max * 8).max(64);
         let mut to = from;
@@ -347,6 +347,27 @@ impl<K: Key, E> JumpArray<K, E> {
         RangeIter {
             slice: &self.entries[from..to],
         }
+    }
+
+    /// `range` 的下界：先线性探 `PROBE_MAX` 步（窗口起点常常就在块首附近），
+    /// 探不动再回退到 [`Self::lower_bound_fast`]。
+    #[inline]
+    fn range_lower_bound(&self, lo: &K) -> usize {
+        const PROBE_MAX: usize = 4;
+        if self.dirty || self.blocks.is_empty() {
+            return self.lower_bound(lo);
+        }
+        let (start, end) = self.block_span(self.block_of(lo));
+        let mut i = start;
+        let mut steps = 0usize;
+        while i < end && steps < PROBE_MAX && self.entries[i].0.cmp_key(lo) == Ordering::Less {
+            i += 1;
+            steps += 1;
+        }
+        if i == end || steps < PROBE_MAX || self.entries[i].0.cmp_key(lo) != Ordering::Less {
+            return i;
+        }
+        self.lower_bound_fast(lo)
     }
 }
 
