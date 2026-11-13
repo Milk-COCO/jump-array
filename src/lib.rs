@@ -113,10 +113,10 @@ impl<K: Key, E> JumpArray<K, E> {
         (self.blocks.len(), self.entries.len(), self.width)
     }
 
-    /// 索引是否就绪：`true` ⇒ 查询走"块表起跳 + 短扫"（O(1) 起跳）；
-    /// `false` ⇒ 写入后未重建，查询退回二分（仍正确，只是多 log n 次比较）。
-    pub fn is_index_ready(&self) -> bool {
-        !self.dirty
+    /// 索引是否被写入弄脏：`true` ⇒ 查询退回二分（仍正确，只是多 log n 次比较），
+    /// 需要 [`JumpArray::rebuild`] 恢复"块表起跳 + 短扫"的快路径。
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     pub fn first(&self) -> Option<(&K, &E)> {
@@ -446,16 +446,16 @@ mod tests {
         }
         a.rebuild();
         let before = a.stats();
-        assert!(a.is_index_ready(), "rebuild 后应就绪");
+        assert!(!a.is_dirty(), "rebuild 后应干净");
         a.rebuild();
         a.rebuild();
         assert_eq!(a.stats(), before, "重复 rebuild 不应改变块表");
-        assert!(a.is_index_ready());
+        assert!(!a.is_dirty());
         // 写入后转脏，再 rebuild 应恢复。
         a.insert(-1, 1).unwrap();
-        assert!(!a.is_index_ready(), "写入后索引过期");
+        assert!(a.is_dirty(), "写入后索引过期");
         a.rebuild();
-        assert!(a.is_index_ready(), "rebuild 后恢复");
+        assert!(!a.is_dirty(), "rebuild 后恢复");
         let (blocks, len, _) = a.stats();
         assert_eq!(len, 1001);
         assert!(blocks > 0);
