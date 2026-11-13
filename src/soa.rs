@@ -63,6 +63,8 @@ pub struct JumpArray<K: Key, E> {
     dirty: bool,
     linear_max: usize,
     binary_below: usize,
+    /// 区间上界的线性探上限（窗口极短时省一次块表查找）。
+    span_scan_max: usize,
     /// 块内元素数 > MINOR_THRESHOLD 时是否建二级锚。
     minor_anchors: bool,
     id: u64,
@@ -90,6 +92,7 @@ impl<K: Key, E> JumpArray<K, E> {
             dirty: true,
             linear_max: DEFAULT_LINEAR_MAX,
             binary_below: DEFAULT_BINARY_BELOW,
+            span_scan_max: RANGE_SCAN_MAX,
             minor_anchors: false,
             id: NEXT_ID.fetch_add(1, AtomicOrdering::Relaxed),
             version: 0,
@@ -115,6 +118,12 @@ impl<K: Key, E> JumpArray<K, E> {
     /// （块表 + 键）加一次乘法。默认 2048（32 KB L1 / 每条 ~32 B ≈ 1k，取保守值）。
     pub fn with_binary_below(mut self, n: usize) -> Self {
         self.binary_below = n;
+        self
+    }
+
+    /// 区间上界的线性探上限（默认 8）：窗口很短时线性探比"块表 + 二分"便宜。
+    pub fn with_span_scan_max(mut self, n: usize) -> Self {
+        self.span_scan_max = n;
         self
     }
 
@@ -478,7 +487,7 @@ impl<K: Key, E> JumpArray<K, E> {
 
     /// `from` 起、上界为 `hi` 的区间结束下标（排他）。
     ///
-    /// 先线性探 `RANGE_SCAN_MAX` 项（窗口极短时省一次块表查找）；探不到就按
+    /// 先线性探 `span_scan_max` 项（窗口极短时省一次块表查找；默认 8）；探不到就按
     /// `hi` 所在块定位：块尾 < hi ⇒ 答案就是块尾；否则在块内二分。
     fn range_end_from(&self, from: usize, hi: &K) -> usize {
         if !self.use_index() {
@@ -486,10 +495,10 @@ impl<K: Key, E> JumpArray<K, E> {
         }
         let n = self.keys.len();
         let mut to = from;
-        while to < n && to - from < RANGE_SCAN_MAX && self.keys[to].cmp_key(hi) != Ordering::Greater {
+        while to < n && to - from < self.span_scan_max && self.keys[to].cmp_key(hi) != Ordering::Greater {
             to += 1;
         }
-        if to - from < RANGE_SCAN_MAX || to == n {
+        if to - from < self.span_scan_max || to == n {
             return to;
         }
         let b = self.block_of(hi);
@@ -1076,6 +1085,25 @@ mod tests {
             }
             let got: Vec<i64> = a.range(100, 900).map(|(k, _)| *k).collect();
             assert_eq!(got, (34..=300).map(|i| i * 3).collect::<Vec<_>>());
+        }
+    }
+
+    /// `span_scan_max` 只影响路径，不影响区间结果。
+    #[test]
+    fn span_scan_max_variants_agree() {
+        for ssm in [0usize, 1, 4, 8, 16, 32] {
+            let mut a = JumpArray::<i64, u8>::new().with_span_scan_max(ssm);
+            for i in 0..3000 {
+                a.insert(i * 997, 0).unwrap();
+            }
+            a.rebuild();
+            for (start, count) in [(0usize, 1usize), (300, 2), (0, 8), (100, 64), (2000, 999)] {
+                let lo = (start as i64) * 997;
+                let hi = ((start + count - 1) as i64) * 997;
+                let got: Vec<i64> = a.range(lo, hi).map(|(k, _)| *k).collect();
+                let want: Vec<i64> = (start..start + count).map(|i| (i as i64) * 997).collect();
+                assert_eq!(got, want, "ssm={ssm} [{start},{count}]");
+            }
         }
     }
 

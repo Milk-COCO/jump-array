@@ -979,6 +979,15 @@ fn main() {
         println!("\n## 小数组二分阈值扫描");
         binary_below_sweep(max_n, "稀疏均匀", sparse, win);
         binary_below_sweep(max_n, "聚簇    ", clustered, win);
+        println!("\n## 时间窗");
+        time_window_split(max_n, "稀疏均匀", sparse, win);
+        time_window_split(max_n, "聚簇    ", clustered, win);
+        println!("\n## span_scan 扫描");
+        span_scan_sweep(max_n, "稀疏均匀", sparse, win);
+        span_scan_sweep(max_n, "聚簇    ", clustered, win);
+        println!("\n## 脏索引节奏");
+        dirty_strategy(max_n, "稀疏均匀", sparse);
+        dirty_strategy(max_n, "聚簇    ", clustered);
         println!("\n## 二级锚 A/B");
         println!("  稀疏均匀");
         print_pair_soa(max_n, sparse, win);
@@ -1041,6 +1050,16 @@ fn main() {
     println!("\n## 小数组二分阈值扫描 n = {n}（0=总用块索引）");
     binary_below_sweep(n, "稀疏均匀", sparse, win);
     binary_below_sweep(n, "聚簇    ", clustered, win);
+
+    // ⑦ 时间窗：按固定键宽切窗、首尾相接（更接近播放的取窗方式）。
+    println!("\n## 时间窗 n = {n}（固定键宽、连续；ns/窗口）");
+    time_window_split(n, "稀疏均匀", sparse, win);
+    time_window_split(n, "聚簇    ", clustered, win);
+
+    // ⑧ 区间上界线性探上限（默认 8）。
+    println!("\n## span_scan 扫描 n = {n}（区间上界线性探上限）");
+    span_scan_sweep(n, "稀疏均匀", sparse, win);
+    span_scan_sweep(n, "聚簇    ", clustered, win);
 }
 
 /// 扫描"元素数 ≤ 阈值就用二分"的拐点。
@@ -1084,6 +1103,155 @@ fn binary_below_sweep(n: usize, label: &str, key: impl Fn(usize) -> i64 + Copy, 
             "  {label} binary_below {below:>6} | rand {rand:>6.1}ns | win-cur {wincur:>6.1}ns"
         );
     }
+}
+
+/// 扫描区间上界的线性探上限（默认 8）。
+fn span_scan_sweep(n: usize, label: &str, key: impl Fn(usize) -> i64 + Copy, win: usize) {
+    let wins = (n / win).max(1);
+    for ssm in [0usize, 2, 4, 8, 16, 32] {
+        let mut a = JumpArray::<i64, u32>::new().with_span_scan_max(ssm);
+        for i in 0..n {
+            a.insert(key(i), i as u32).ok();
+        }
+        a.rebuild();
+        let win_ns = bench(|| {
+            let mut acc = 0i64;
+            for w in 0..wins {
+                let lo = key(w * win);
+                let hi = key(((w + 1) * win).min(n - 1));
+                for (k, _) in a.range(lo, hi) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+            black_box(acc);
+        }) * 1e9
+            / wins as f64;
+        let wincur_ns = bench(|| {
+            let mut cur = a.cursor();
+            let mut acc = 0i64;
+            for w in 0..wins {
+                let lo = key(w * win);
+                let hi = key(((w + 1) * win).min(n - 1));
+                for (k, _) in a.range_from(&mut cur, lo, hi) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+            black_box(acc);
+        }) * 1e9
+            / wins as f64;
+        println!(
+            "  {label} span_scan {ssm:>3} | win {win_ns:>6.1}ns | win-cur {wincur_ns:>6.1}ns"
+        );
+    }
+}
+
+/// 脏索引期的两种节奏：每写一次就 `rebuild` vs 写完继续用二分查、最后重建。
+fn dirty_strategy(n: usize, label: &str, key: impl Fn(usize) -> i64 + Copy) {
+    let mut rng = Rng(0xabcd_ef01_2345_6789);
+    let writes: Vec<i64> = (0..100).map(|_| rng.below((n as u64) * 1997) as i64).collect();
+    let queries: Vec<i64> = (0..1000).map(|_| rng.below((n as u64) * 1997) as i64).collect();
+    let per_write = 10usize;
+
+    let each = bench(|| {
+        let mut j = JumpArray::<i64, u32>::new();
+        for i in 0..n {
+            j.insert(key(i), 0).ok();
+        }
+        j.rebuild();
+        let mut acc = 0i64;
+        for &w in &writes {
+            j.insert(w, 0).ok();
+            j.rebuild();
+            for &q in &queries[..per_write] {
+                if let Some((k, _)) = j.find_le(&q) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+        }
+        black_box(acc);
+    }) * 1e9
+        / (writes.len() * per_write) as f64;
+
+    let dirty = bench(|| {
+        let mut j = JumpArray::<i64, u32>::new();
+        for i in 0..n {
+            j.insert(key(i), 0).ok();
+        }
+        j.rebuild();
+        let mut acc = 0i64;
+        for &w in &writes {
+            j.insert(w, 0).ok();
+            for &q in &queries[..per_write] {
+                if let Some((k, _)) = j.find_le(&q) {
+                    acc = acc.wrapping_add(*k);
+                }
+            }
+        }
+        j.rebuild();
+        black_box(acc);
+    }) * 1e9
+        / (writes.len() * per_write) as f64;
+
+    println!("  {label} | 每次写完 rebuild {each:>9.1}ns/查询 | 脏着查、最后重建 {dirty:>9.1}ns/查询");
+}
+
+/// 时间窗：按固定键宽切窗（首尾相接），窗口内元素数随数据密度变化。
+fn time_window_split(n: usize, label: &str, key: impl Fn(usize) -> i64 + Copy, win: usize) {
+    let wins = (n / win).max(1);
+    let first = key(0);
+    let span = key(n - 1) - first;
+    let width = ((span as f64) / wins as f64).ceil().max(1.0) as i64;
+    let mut j = JumpArray::<i64, u32>::new();
+    let mut v: Vec<(i64, u32)> = Vec::with_capacity(n);
+    for i in 0..n {
+        let k = key(i);
+        j.insert(k, i as u32).ok();
+        v.push((k, i as u32));
+    }
+    j.rebuild();
+
+    let jump_win = bench(|| {
+        let mut acc = 0i64;
+        for t in 0..wins {
+            let lo = first + (t as i64) * width;
+            let hi = lo + width - 1;
+            for (k, _) in j.range(lo, hi) {
+                acc = acc.wrapping_add(*k);
+            }
+        }
+        black_box(acc);
+    }) * 1e9
+        / wins as f64;
+    let jump_cur = bench(|| {
+        let mut cur = j.cursor();
+        let mut acc = 0i64;
+        for t in 0..wins {
+            let lo = first + (t as i64) * width;
+            let hi = lo + width - 1;
+            for (k, _) in j.range_from(&mut cur, lo, hi) {
+                acc = acc.wrapping_add(*k);
+            }
+        }
+        black_box(acc);
+    }) * 1e9
+        / wins as f64;
+    let vec_win = bench(|| {
+        let mut acc = 0i64;
+        for t in 0..wins {
+            let lo = first + (t as i64) * width;
+            let hi = lo + width - 1;
+            let a = v.partition_point(|(x, _)| *x < lo);
+            let b = v.partition_point(|(x, _)| *x <= hi);
+            for (k, _) in &v[a..b] {
+                acc = acc.wrapping_add(*k);
+            }
+        }
+        black_box(acc);
+    }) * 1e9
+        / wins as f64;
+    println!(
+        "  {label} | jump win {jump_win:>6.1}ns cur {jump_cur:>6.1}ns | vec win {vec_win:>6.1}ns"
+    );
 }
 
 /// 把"定位"和"迭代"分开计时：两边都按同样的 `win` 元素窗口序列。
