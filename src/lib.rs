@@ -148,6 +148,41 @@ impl<K: Key, E> JumpArray<K, E> {
         s
     }
 
+    /// 从**已按 key 升序、且无重复**的条目批量构造（导入/反序列化路径）。
+    ///
+    /// 不做任何排序或去重（那是调用方的责任，debug 断言会检查）；索引仍是懒建的，
+    /// 第一次查询或显式 [`JumpArray::rebuild`] 之前走二分。
+    pub fn from_sorted(items: Vec<(K, E)>) -> Self {
+        debug_assert!(
+            items.windows(2).all(|w| w[0].0.cmp_key(&w[1].0) == Ordering::Less),
+            "from_sorted 要求 key 严格升序且无重复"
+        );
+        let mut s = Self::new();
+        s.entries = items;
+        s.dirty = true;
+        s
+    }
+
+    /// 追加一段**已升序、且键都大于当前最大键**的条目（批量导入的常见形态）。
+    pub fn extend_sorted(&mut self, items: impl IntoIterator<Item = (K, E)>) {
+        let mut prev = self.entries.last().map(|(k, _)| *k);
+        let before = self.entries.len();
+        for (k, v) in items {
+            if let Some(p) = prev {
+                debug_assert!(
+                    p.cmp_key(&k) == Ordering::Less,
+                    "extend_sorted 要求严格升序，且都大于现有最大键"
+                );
+            }
+            prev = Some(k);
+            self.entries.push((k, v));
+        }
+        if self.entries.len() != before {
+            self.dirty = true;
+            self.version = self.version.wrapping_add(1);
+        }
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -940,6 +975,32 @@ mod tests {
                 "find_ge_from {q}"
             );
         }
+    }
+
+    /// 批量构造/追加：顺序、去重前提、脏标记与查询都正确。
+    #[test]
+    fn bulk_sorted_construct_and_extend() {
+        let items: Vec<(i64, u8)> = (0..500).map(|i| (i * 3, (i % 7) as u8)).collect();
+        let mut a = JumpArray::from_sorted(items.clone());
+        assert_eq!(a.len(), 500);
+        assert!(a.is_dirty(), "懒建索引：先脏");
+        // 脏索引下查询走二分，结果正确
+        assert_eq!(a.find_le(&299).map(|(k, _)| *k), Some(297));
+        a.rebuild();
+        assert!(!a.is_dirty());
+        // 追加一段更大的键
+        let tail: Vec<(i64, u8)> = (500..1000).map(|i| (i * 3, 0)).collect();
+        a.extend_sorted(tail);
+        assert_eq!(a.len(), 1000);
+        assert!(a.is_dirty());
+        a.rebuild();
+        assert_eq!(a.last().map(|(k, _)| *k), Some(2997));
+        assert_eq!(a.find_ge(&2998), None);
+        assert_eq!(a.find_le(&2999).map(|(k, _)| *k), Some(2997));
+        assert_eq!(
+            a.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            (0..1000).map(|i| i * 3).collect::<Vec<_>>()
+        );
     }
 
     /// 删末尾走快速路径：按序回滚/清理时正确且保持查询一致。
