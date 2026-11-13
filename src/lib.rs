@@ -377,14 +377,24 @@ impl<K: Key, E> JumpArray<K, E> {
     }
 
     /// `from` 起、上界为 `hi` 的区间结束下标（排他）。
+    ///
+    /// 先线性探 `RANGE_SCAN_MAX` 个元素（窗口极短时省掉一次块表查找），探不到就
+    /// 回退 [`Self::upper_bound_fast`]（块跳 + 块内线性/二分）。
+    ///
+    /// ⚠️ 这个上限必须与"一次块内二分的比较次数"同量级（~log 块内元素数），
+    /// **不能按窗口大小取**：窗口越大，线性探重复走的元素越多，反而比直接二分贵。
     fn range_end_from(&self, from: usize, hi: &K) -> usize {
+        const RANGE_SCAN_MAX: usize = 8;
         let n = self.entries.len();
-        let cap = (self.linear_max * 8).max(64);
         let mut to = from;
-        while to < n && to - from < cap && self.entries[to].0.cmp_key(hi) != Ordering::Greater {
+        while to < n
+            && to - from < RANGE_SCAN_MAX
+            && self.entries[to].0.cmp_key(hi) != Ordering::Greater
+        {
             to += 1;
         }
-        if to - from >= cap && to < n && self.entries[to].0.cmp_key(hi) != Ordering::Greater {
+        if to - from >= RANGE_SCAN_MAX && to < n && self.entries[to].0.cmp_key(hi) != Ordering::Greater
+        {
             to = self.upper_bound_fast(hi).max(from);
         }
         to
@@ -435,6 +445,11 @@ impl<K: Key, E> JumpArray<K, E> {
             return i;
         }
         let mut i = cur.pos.min(n);
+        if i < n && self.entries[i].0.cmp_key(k) == Ordering::Equal {
+            // 恰好命中：直接返回，省掉向左扫。
+            cur.pos = i;
+            return i;
+        }
         if i == n || self.entries[i].0.cmp_key(k) != Ordering::Less {
             // 答案在 i 处或左侧
             let mut steps = 0usize;
