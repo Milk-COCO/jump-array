@@ -24,6 +24,18 @@ trait Store {
     fn iter_all<'a>(&'a self) -> Box<dyn Iterator<Item = (&'a i64, &'a u32)> + 'a>;
     fn range<'a>(&'a self, lo: i64, hi: i64) -> Box<dyn Iterator<Item = (&'a i64, &'a u32)> + 'a>;
     fn mem_bytes(&self) -> usize;
+    /// 顺序滑窗求和（用 `range` 的无状态实现；有游标的实现覆盖它）。
+    fn window_sum(&self, key: &dyn Fn(usize) -> i64, wins: usize, n: usize) -> i64 {
+        let mut acc = 0i64;
+        for w in 0..wins {
+            let lo = key(w * 64);
+            let hi = key(((w + 1) * 64).min(n - 1));
+            for (k, _) in self.range(lo, hi) {
+                acc = acc.wrapping_add(*k);
+            }
+        }
+        acc
+    }
     /// 批量写完之后调用。
     fn finalize(&mut self) {}
     fn label() -> &'static str;
@@ -102,6 +114,18 @@ impl Store for Jump {
     fn mem_bytes(&self) -> usize {
         let (blocks, len, _) = self.0.stats();
         len * std::mem::size_of::<(i64, u32)>() + blocks * 4
+    }
+    fn window_sum(&self, key: &dyn Fn(usize) -> i64, wins: usize, n: usize) -> i64 {
+        let mut cur = self.0.cursor();
+        let mut acc = 0i64;
+        for w in 0..wins {
+            let lo = key(w * 64);
+            let hi = key(((w + 1) * 64).min(n - 1));
+            for (k, _) in self.0.range_from(&mut cur, lo, hi) {
+                acc = acc.wrapping_add(*k);
+            }
+        }
+        acc
     }
     fn finalize(&mut self) {
         self.0.rebuild();
@@ -185,6 +209,7 @@ struct Metrics {
     seq_ns: f64,
     iter_ns: f64,
     win_ns: f64,
+    wincur_ns: f64,
     ins_ns: f64,
     del_ns: f64,
 }
@@ -256,6 +281,12 @@ fn measure<S: Store>(n: usize, key: impl Fn(usize) -> i64) -> Metrics {
     }) * 1e9
         / wins as f64;
 
+    // 顺序滑窗（有游标的实现走 `range_from`，其余等价于上面的 range）。
+    let wincur_ns = bench(|| {
+        black_box(store.window_sum(&key, wins, n));
+    }) * 1e9
+        / wins as f64;
+
     let add = (n / 10).clamp(100, 2000);
     let mut rng = Rng(0xdead_beef_1234_5678);
     let inserts: Vec<i64> = (0..add)
@@ -294,6 +325,7 @@ fn measure<S: Store>(n: usize, key: impl Fn(usize) -> i64) -> Metrics {
         seq_ns,
         iter_ns,
         win_ns,
+        wincur_ns,
         ins_ns,
         del_ns,
     }
@@ -302,7 +334,7 @@ fn measure<S: Store>(n: usize, key: impl Fn(usize) -> i64) -> Metrics {
 fn print_row<S: Store, F: Fn(usize) -> i64 + Copy>(n: usize, key: F) {
     let m = measure::<S>(n, key);
     println!(
-        "  {:<10} build {:>8.2}ms | mem {:>5.2}MB | find_le rand {:>6.1}ns seq {:>5.1}ns | iter {:>5.2}ns/e | win {:>6.1}ns | ins {:>9.1}ns | del {:>9.1}ns",
+        "  {:<10} build {:>8.2}ms | mem {:>5.2}MB | find_le rand {:>6.1}ns seq {:>5.1}ns | iter {:>5.2}ns/e | win {:>6.1}ns | win-cur {:>6.1}ns | ins {:>9.1}ns | del {:>9.1}ns",
         S::label(),
         m.build_ms,
         m.mem_mb,
@@ -310,6 +342,7 @@ fn print_row<S: Store, F: Fn(usize) -> i64 + Copy>(n: usize, key: F) {
         m.seq_ns,
         m.iter_ns,
         m.win_ns,
+        m.wincur_ns,
         m.ins_ns,
         m.del_ns
     );

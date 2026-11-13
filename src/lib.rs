@@ -75,10 +75,35 @@ pub struct JumpArray<K: Key, E> {
     dirty: bool,
     /// 块内元素数不超过它时线性扫，超过则块内二分（可调）。
     linear_max: usize,
+    /// 实例唯一 id（游标跨实例误用检测）。
+    id: u64,
+    /// 写入代数：`insert`/`remove` +1；`rebuild` 不改下标，故不变。
+    version: u32,
 }
 
 /// `linear_max` 默认值。
 const DEFAULT_LINEAR_MAX: usize = 8;
+
+/// 进程内自增的实例 id。
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// 顺序访问游标（属于某个 [`JumpArray`] 实例）。
+///
+/// 语义：`pos` 是上一次查询落在 `entries` 里的下标（允许等于 `len`，表示末尾之后）。
+/// `id`/`version` 不匹配时视为过期——查询自动走冷路径，结果仍然正确。
+#[derive(Debug, Clone, Copy)]
+pub struct Cursor {
+    id: u64,
+    version: u32,
+    pos: usize,
+}
+
+impl Cursor {
+    /// 游标当前下标（诊断/断言用；`len` 表示末尾之后）。
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+}
 
 impl<K: Key, E> Default for JumpArray<K, E> {
     fn default() -> Self {
@@ -95,6 +120,8 @@ impl<K: Key, E> JumpArray<K, E> {
             width: 1.0,
             dirty: true,
             linear_max: DEFAULT_LINEAR_MAX,
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            version: 0,
         }
     }
 
@@ -268,6 +295,7 @@ impl<K: Key, E> JumpArray<K, E> {
         }
         self.entries.insert(pos, (key, value));
         self.dirty = true;
+        self.version = self.version.wrapping_add(1);
         Ok(())
     }
 
@@ -279,6 +307,7 @@ impl<K: Key, E> JumpArray<K, E> {
         }
         let (_, v) = self.entries.remove(pos);
         self.dirty = true;
+        self.version = self.version.wrapping_add(1);
         Some(v)
     }
 
@@ -332,20 +361,171 @@ impl<K: Key, E> JumpArray<K, E> {
     /// `hi` 才回退到 `upper_bound_fast`（块内二分/二分）。
     pub fn range(&self, lo: K, hi: K) -> RangeIter<'_, K, E> {
         if self.is_empty() || lo.cmp_key(&hi) == Ordering::Greater {
-            return RangeIter { slice: &[] };
+            return RangeIter {
+                slice: &[],
+                start: 0,
+                end: 0,
+            };
         }
         let from = self.lower_bound_fast(&lo);
+        let to = self.range_end_from(from, &hi);
+        RangeIter {
+            slice: &self.entries[from..to],
+            start: from,
+            end: to,
+        }
+    }
+
+    /// `from` 起、上界为 `hi` 的区间结束下标（排他）。
+    fn range_end_from(&self, from: usize, hi: &K) -> usize {
         let n = self.entries.len();
         let cap = (self.linear_max * 8).max(64);
         let mut to = from;
-        while to < n && to - from < cap && self.entries[to].0.cmp_key(&hi) != Ordering::Greater {
+        while to < n && to - from < cap && self.entries[to].0.cmp_key(hi) != Ordering::Greater {
             to += 1;
         }
-        if to - from >= cap && to < n && self.entries[to].0.cmp_key(&hi) != Ordering::Greater {
-            to = self.upper_bound_fast(&hi).max(from);
+        if to - from >= cap && to < n && self.entries[to].0.cmp_key(hi) != Ordering::Greater {
+            to = self.upper_bound_fast(hi).max(from);
         }
+        to
+    }
+
+    /// 按下标取条目（配合 [`RangeIter::span`] / [`Cursor::pos`] 使用）。
+    pub fn entry(&self, i: usize) -> Option<(&K, &E)> {
+        self.entries.get(i).map(|(k, v)| (k, v))
+    }
+
+    /// 创建属于本实例的游标（顺序访问用）。
+    pub fn cursor(&self) -> Cursor {
+        Cursor {
+            id: self.id,
+            version: self.version,
+            pos: 0,
+        }
+    }
+
+    /// 游标是否仍可用（未过期、且属于本实例）。
+    fn cursor_ok(&self, cur: &Cursor) -> bool {
+        cur.id == self.id && cur.version == self.version
+    }
+
+    /// 从游标出发找"第一个 `key >= k`"：先双向线性推进，超过步数上限再回退块索引。
+    fn cursor_lower_bound(&self, cur: &mut Cursor, k: &K) -> usize {
+        const STEP_MAX: usize = 32;
+        let n = self.entries.len();
+        if !self.cursor_ok(cur) {
+            cur.id = self.id;
+            cur.version = self.version;
+            let i = self.lower_bound_fast(k);
+            cur.pos = i;
+            return i;
+        }
+        let mut i = cur.pos.min(n);
+        if i == n || self.entries[i].0.cmp_key(k) != Ordering::Less {
+            // 答案在 i 处或左侧
+            let mut steps = 0usize;
+            while i > 0 && self.entries[i - 1].0.cmp_key(k) != Ordering::Less && steps < STEP_MAX
+            {
+                i -= 1;
+                steps += 1;
+            }
+            if i > 0 && self.entries[i - 1].0.cmp_key(k) != Ordering::Less {
+                i = self.lower_bound_fast(k);
+            }
+            cur.pos = i;
+            return i;
+        }
+        // 答案在右侧
+        let mut steps = 0usize;
+        while i < n && self.entries[i].0.cmp_key(k) == Ordering::Less && steps < STEP_MAX {
+            i += 1;
+            steps += 1;
+        }
+        if i < n && self.entries[i].0.cmp_key(k) == Ordering::Less {
+            i = self.lower_bound_fast(k);
+        }
+        cur.pos = i;
+        i
+    }
+
+    /// 从游标出发找"第一个 `key > k`"。
+    fn cursor_upper_bound(&self, cur: &mut Cursor, k: &K) -> usize {
+        const STEP_MAX: usize = 32;
+        let n = self.entries.len();
+        if !self.cursor_ok(cur) {
+            cur.id = self.id;
+            cur.version = self.version;
+            let i = self.upper_bound_fast(k);
+            cur.pos = i;
+            return i;
+        }
+        let mut i = cur.pos.min(n);
+        if i == n || self.entries[i].0.cmp_key(k) == Ordering::Greater {
+            let mut steps = 0usize;
+            while i > 0 && self.entries[i - 1].0.cmp_key(k) == Ordering::Greater && steps < STEP_MAX
+            {
+                i -= 1;
+                steps += 1;
+            }
+            if i > 0 && self.entries[i - 1].0.cmp_key(k) == Ordering::Greater {
+                i = self.upper_bound_fast(k);
+            }
+            cur.pos = i;
+            return i;
+        }
+        let mut steps = 0usize;
+        while i < n && self.entries[i].0.cmp_key(k) != Ordering::Greater && steps < STEP_MAX {
+            i += 1;
+            steps += 1;
+        }
+        if i < n && self.entries[i].0.cmp_key(k) != Ordering::Greater {
+            i = self.upper_bound_fast(k);
+        }
+        cur.pos = i;
+        i
+    }
+
+    /// 从游标出发的 `find_le`。
+    pub fn find_le_from(&self, cur: &mut Cursor, k: &K) -> Option<(&K, &E)> {
+        if self.is_empty() {
+            *cur = self.cursor();
+            return None;
+        }
+        let i = self.cursor_upper_bound(cur, k);
+        if i == 0 {
+            None
+        } else {
+            cur.pos = i - 1;
+            self.entry(i - 1)
+        }
+    }
+
+    /// 从游标出发的 `find_ge`。
+    pub fn find_ge_from(&self, cur: &mut Cursor, k: &K) -> Option<(&K, &E)> {
+        if self.is_empty() {
+            *cur = self.cursor();
+            return None;
+        }
+        let i = self.cursor_lower_bound(cur, k);
+        self.entry(i)
+    }
+
+    /// 从游标出发的 `range`：顺序窗口直接前推，跨大步时回退块索引/二分。
+    pub fn range_from(&self, cur: &mut Cursor, lo: K, hi: K) -> RangeIter<'_, K, E> {
+        if self.is_empty() || lo.cmp_key(&hi) == Ordering::Greater {
+            return RangeIter {
+                slice: &[],
+                start: 0,
+                end: 0,
+            };
+        }
+        let from = self.cursor_lower_bound(cur, &lo);
+        let to = self.range_end_from(from, &hi);
+        cur.pos = to;
         RangeIter {
             slice: &self.entries[from..to],
+            start: from,
+            end: to,
         }
     }
 }
@@ -358,9 +538,20 @@ fn pow2_ceil(x: f64) -> f64 {
     2f64.powf(e)
 }
 
-/// [`JumpArray::range`] 的迭代器。
+/// [`JumpArray::range`] / [`JumpArray::range_from`] 的迭代器。
 pub struct RangeIter<'a, K: Key, E> {
     slice: &'a [(K, E)],
+    start: usize,
+    end: usize,
+}
+
+impl<'a, K: Key, E> RangeIter<'a, K, E> {
+    /// 区间在 `entries` 里的下标范围 `[start, end)`（配合 [`JumpArray::entry`] 使用）。
+    ///
+    /// 写入后这些下标会失效（数组发生搬移），与游标一样按版本判断。
+    pub fn span(&self) -> (usize, usize) {
+        (self.start, self.end)
+    }
 }
 
 impl<'a, K: Key, E> Iterator for RangeIter<'a, K, E> {
@@ -600,5 +791,123 @@ mod tests {
         assert_eq!(got, keys[..200].to_vec());
         let got: Vec<i64> = a.range(0, 4000).map(|(k, _)| *k).collect();
         assert_eq!(got, keys[..401].to_vec());
+    }
+
+    /// 顺序滑窗：`range_from` 与 `range` 结果一致，`span()` 与 `entry()` 对得上。
+    #[test]
+    fn cursor_windows_match_range() {
+        for clustered in [false, true] {
+            let mut a = JumpArray::<i64, u8>::new();
+            let keys: Vec<i64> = (0..3000i64)
+                .map(|i| {
+                    if clustered {
+                        (i / 100) * 100_000 + (i % 100)
+                    } else {
+                        i * 37
+                    }
+                })
+                .collect();
+            for k in &keys {
+                a.insert(*k, 0).unwrap();
+            }
+            a.rebuild();
+            let mut cur = a.cursor();
+            for w in 0..keys.len() / 64 {
+                let lo = keys[w * 64];
+                let hi = keys[(w * 64 + 63).min(keys.len() - 1)];
+                let plain: Vec<i64> = a.range(lo, hi).map(|(k, _)| *k).collect();
+                let mut it = a.range_from(&mut cur, lo, hi);
+                let (from, to) = it.span();
+                let got: Vec<i64> = it.by_ref().map(|(k, _)| *k).collect();
+                assert_eq!(got, plain, "clustered={clustered} w={w}");
+                assert_eq!(
+                    a.entry(from).map(|(k, _)| *k),
+                    plain.first().copied(),
+                    "span 起点"
+                );
+                assert_eq!(a.entry(to.saturating_sub(1)).map(|(k, _)| *k), plain.last().copied());
+                assert_eq!(cur.pos(), to, "游标停在区间末尾之后");
+            }
+        }
+    }
+
+    /// 写入使游标过期：之后继续用游标，结果仍与二分一致（自动走冷路径）。
+    #[test]
+    fn cursor_recovers_after_writes() {
+        let mut a = JumpArray::<i64, u8>::new();
+        for i in 0..1000 {
+            a.insert(i * 3, 0).unwrap();
+        }
+        a.rebuild();
+        let mut cur = a.cursor();
+        assert_eq!(a.find_le_from(&mut cur, &300).map(|(k, _)| *k), Some(300));
+        // 写入：下标整体移动，游标过期
+        a.insert(-5, 0).unwrap();
+        a.insert(299, 0).unwrap();
+        a.rebuild();
+        for q in [0i64, 1, 150, 298, 299, 301, 2997, 3000] {
+            let mut c2 = cur;
+            let want = a.find_le(&q).map(|(k, _)| *k);
+            let got = a.find_le_from(&mut c2, &q).map(|(k, _)| *k);
+            assert_eq!(got, want, "过期游标查询 {q}");
+            let want_ge = a.find_ge(&q).map(|(k, _)| *k);
+            let mut c3 = cur;
+            let got_ge = a.find_ge_from(&mut c3, &q).map(|(k, _)| *k);
+            assert_eq!(got_ge, want_ge, "过期游标 find_ge {q}");
+        }
+    }
+
+    /// 双向：递增、递减、来回跳，结果都与无游标版本一致。
+    #[test]
+    fn cursor_bidirectional_matches() {
+        let mut a = JumpArray::<i64, u8>::new();
+        for i in 0..2000 {
+            a.insert(i * 11, 0).unwrap();
+        }
+        a.rebuild();
+        let probes: Vec<i64> = [1, 5000, 12, 21000, 3, 15000, 21990, 7000, 0, 22000]
+            .iter()
+            .copied()
+            .collect();
+        let mut cur = a.cursor();
+        for q in probes {
+            assert_eq!(
+                a.find_le_from(&mut cur, &q).map(|(k, _)| *k),
+                a.find_le(&q).map(|(k, _)| *k),
+                "find_le_from {q}"
+            );
+            assert_eq!(
+                a.find_ge_from(&mut cur, &q).map(|(k, _)| *k),
+                a.find_ge(&q).map(|(k, _)| *k),
+                "find_ge_from {q}"
+            );
+        }
+    }
+
+    /// 跨实例的游标：id 不匹配 ⇒ 退回冷路径，结果正确。
+    #[test]
+    fn cursor_from_other_instance_falls_back() {
+        let mut a = JumpArray::<i64, u8>::new();
+        let mut b = JumpArray::<i64, u8>::new();
+        for i in 0..100 {
+            a.insert(i * 2, 0).unwrap();
+            b.insert(i * 3, 0).unwrap();
+        }
+        a.rebuild();
+        b.rebuild();
+        let mut cur = a.cursor();
+        assert_eq!(a.find_le_from(&mut cur, &50).map(|(k, _)| *k), Some(50));
+        // 拿 a 的游标查 b：必须正确（走冷路径）
+        assert_eq!(
+            b.find_le_from(&mut cur, &50).map(|(k, _)| *k),
+            Some(48),
+            "跨实例游标应退回冷路径"
+        );
+        assert_eq!(
+            b.range_from(&mut cur, 0, 20)
+                .map(|(k, _)| *k)
+                .collect::<Vec<_>>(),
+            vec![0, 3, 6, 9, 12, 15, 18]
+        );
     }
 }
