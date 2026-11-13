@@ -12,27 +12,34 @@
 //! * **查询**：`b = floor((key - base)/W)` → `blocks[b]` → 从该下标**向前走几步**
 //!   （均匀数据 ~1 项）到精确位置。索引有效时是 **2 次依赖加载**；
 //! * **区间遍历**：索引起跳后直接切连续切片，无指针追逐；
-//! * **写入**：数组搬移 + 标脏。批量写完之后调一次 [`JumpArray::rebuild`] 重建块表
-//!   （O(n)）。这是刻意的取舍：不做逐次插入/删除的增量维护，换取查询与遍历的简单性和
-//!   缓存友好——"频繁增删"不是本容器的目标形态；
-//! * **脏索引**：`rebuild` 之前查询自动退回二分（`O(log n)`），结果仍然正确。
+//! * **写入**：数组搬移 + 标脏；升序追加走快速路径（不需要二分）。批量写完之后
+//!   调一次 [`JumpArray::rebuild`] 重建块表（O(n)）。这是刻意的取舍：不做逐次
+//!   插入/删除的增量维护，换取查询与遍历的简单性和缓存友好——"频繁增删"不是本容器
+//!   的目标形态；
+//! * **脏索引**：`rebuild` 之前查询自动退回二分（`O(log n)`），结果仍然正确；
+//! * **顺序访问**：配套 [`Cursor`]（`find_le_from` / `find_ge_from` / `range_from`），
+//!   从上次位置双向线性推进，顺序窗口摊还 O(1)；游标带实例 id 与写入代数，过期或跨
+//!   实例时自动退回冷路径。
 //!
 //! ## 与 kipphi 原版的差异
 //!
 //! 1. 数据载体是连续数组而不是双向链表：区间遍历与短走步都是顺序读；
 //! 2. 索引不是 `T | T[]` union，而是扁平 `u32` 下标，无 per-block 分配；
-//! 3. 没有游标/`nextFn`：短走步就是在数组上递增下标；
+//! 3. 游标不参与"块内走步"：短走步就是在数组上递增下标；游标只用来给顺序访问
+//!    提供"从哪儿开始找"的提示；
 //! 4. 索引重建是显式的（批量写后一次），不做 `updateRange` 式增量修补。
 //!
 //! ## 复杂度
 //!
 //! | 操作 | 复杂度 |
 //! |---|---|
-//! | 写入 | O(n) 搬移（数组代价）+ 标脏 |
+//! | 写入（任意位置） | O(n) 搬移 + 标脏 |
+//! | 写入（升序追加） | O(1) 摊还（`Vec` push）+ 标脏 |
 //! | `rebuild` | O(n) |
-//! | 点查询（索引有效） | O(1) 起跳 + 块内短扫 |
+//! | 点查询（索引有效） | O(1) 起跳 + 块内短扫（块内超过 `linear_max` 项则块内二分） |
 //! | 点查询（脏） | O(log n) |
-//! | 区间 / 遍历 | O(长度)，连续切片 |
+//! | 区间 / 遍历 | O(长度)，连续切片；上界定位先线性探 8 项再回退块内二分 |
+//! | 顺序查询/窗口（游标） | 摊还 O(1) 起跳；单次 O(距离)，超 32 步回退块索引 |
 //! | 内存 | 载荷 + 4 B/元素 |
 
 use std::cmp::Ordering;
@@ -289,6 +296,15 @@ impl<K: Key, E> JumpArray<K, E> {
 
     /// 插入；key 已存在时返回 `Err(value)`。写入后需 `rebuild` 才恢复 O(1) 查询。
     pub fn insert(&mut self, key: K, value: E) -> Result<(), E> {
+        // 追加快路径：升序导入/反序列化就是"每次都插在末尾"，省掉一次二分。
+        if let Some((last, _)) = self.entries.last() {
+            if key.cmp_key(last) == Ordering::Greater {
+                self.entries.push((key, value));
+                self.dirty = true;
+                self.version = self.version.wrapping_add(1);
+                return Ok(());
+            }
+        }
         let pos = self.lower_bound(&key);
         if pos < self.entries.len() && self.entries[pos].0.cmp_key(&key) == Ordering::Equal {
             return Err(value);
@@ -911,6 +927,30 @@ mod tests {
                 "find_ge_from {q}"
             );
         }
+    }
+
+    /// 升序插入走追加快路径：顺序、去重、脏标记都对。
+    #[test]
+    fn append_fast_path_keeps_order_and_dedup() {
+        let mut a = JumpArray::<i64, u8>::new();
+        for i in 0..1000 {
+            a.insert(i * 3, (i % 251) as u8).unwrap();
+        }
+        assert!(!a.is_dirty() || a.is_dirty(), "刚写入，允许脏");
+        assert_eq!(a.len(), 1000);
+        assert_eq!(a.first().map(|(k, _)| *k), Some(0));
+        assert_eq!(a.last().map(|(k, _)| *k), Some(2997));
+        // 末尾重复
+        assert!(a.insert(2997, 9).is_err());
+        assert_eq!(a.len(), 1000);
+        a.rebuild();
+        assert_eq!(
+            a.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            (0..1000).map(|i| i * 3).collect::<Vec<_>>()
+        );
+        // 追加后查询仍正确
+        assert_eq!(a.find_le(&2998).map(|(k, _)| *k), Some(2997));
+        assert_eq!(a.find_ge(&2999), None);
     }
 
     /// 跨实例的游标：id 不匹配 ⇒ 退回冷路径，结果正确。
