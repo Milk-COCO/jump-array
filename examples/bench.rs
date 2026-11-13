@@ -192,14 +192,40 @@ impl Rng {
 
 const ROUNDS: usize = 5;
 
+/// 固定 CPU 负载耗时（毫秒）：降频/被抢占时会显著变长，用来剔除坏轮次。
+fn cpu_probe_ms() -> f64 {
+    let t = Instant::now();
+    let mut x = 0u64;
+    for i in 0..2_000_000u64 {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(i);
+    }
+    black_box(x);
+    t.elapsed().as_secs_f64() * 1e3
+}
+
+/// 每轮先测一次 probe；只保留 probe ≤ 最优 probe × 1.2 的轮次，取中位数。
+///
+/// 只取 `min` 会让"偶发一次极快"主导结果；只取中位数又可能被降频轮次拖偏，
+/// 所以先按 probe 过滤再取中位数。
 fn bench(mut f: impl FnMut()) -> f64 {
-    let mut best = f64::MAX;
+    let mut samples: Vec<(f64, f64)> = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
+        let probe = cpu_probe_ms();
         let t = Instant::now();
         f();
-        best = best.min(t.elapsed().as_secs_f64());
+        samples.push((probe, t.elapsed().as_secs_f64()));
     }
-    best
+    let best_probe = samples.iter().map(|(p, _)| *p).fold(f64::MAX, f64::min);
+    let mut times: Vec<f64> = samples
+        .iter()
+        .filter(|(p, _)| *p <= best_probe * 1.2)
+        .map(|(_, e)| *e)
+        .collect();
+    if times.is_empty() {
+        times = samples.iter().map(|(_, e)| *e).collect();
+    }
+    times.sort_by(f64::total_cmp);
+    times[times.len() / 2]
 }
 
 struct Metrics {
