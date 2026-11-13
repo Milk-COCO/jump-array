@@ -22,6 +22,8 @@
 //! * **块号精确计算**：块宽是 `2^shift`，块号由 [`Key::block_offset`] 在键自己的
 //!   类型上算——整数键用整数运算（大整数不会因 f64 量化被挤进同一块），内部以
 //!   f64 存储的键（`f64`、`Beat`）用 f64 运算；`to_f64` 只用来估 `shift`；
+//! * **分数键**：打开 `ratio` feature 后 `fraction::Ratio<T>` 实现 [`Key`]，
+//!   块号用分子/分母的整数运算精确计算；
 //! * **顺序访问**：配套 [`Cursor`]（`find_le_from` / `find_ge_from` / `range_from`），
 //!   从上次位置双向线性推进，顺序窗口摊还 O(1)；游标带实例 id 与写入代数，过期或跨
 //!   实例时自动退回冷路径。
@@ -111,13 +113,53 @@ impl Key for f64 {
         self
     }
 }
+
+/// 分数键：`fraction::Ratio<T>`（需要 `ratio` feature）。
+///
+/// 块号用分数自己的运算精确计算：分子/分母都是整数，`2^shift` 作为整数因子参与
+/// 乘除，最后取整除（正数即向下取整）。因此 `2^60 + 1/3` 这类在 f64 里无法区分的
+/// 键仍然保持块粒度。
+#[cfg(feature = "ratio")]
+macro_rules! impl_ratio_key {
+    ($($t:ty),*) => {$(
+        impl Key for fraction::Ratio<$t> {
+            #[inline]
+            fn cmp_key(&self, other: &Self) -> Ordering {
+                self.cmp(other)
+            }
+            #[inline]
+            fn to_f64(self) -> f64 {
+                let (n, d) = self.into_raw();
+                (n as f64) / (d as f64)
+            }
+            #[inline]
+            fn block_offset(&self, base: &Self, shift: i32) -> usize {
+                if self.cmp(base) != Ordering::Greater {
+                    return 0;
+                }
+                let diff = *self - *base;
+                let m = shift.unsigned_abs().min(62);
+                let two = (1 as $t) << m;
+                let q = if shift >= 0 {
+                    diff / fraction::Ratio::from_integer(two)
+                } else {
+                    diff * fraction::Ratio::from_integer(two)
+                };
+                let (n, d) = q.into_raw();
+                (n / d) as usize
+            }
+        }
+    )*};
+}
+#[cfg(feature = "ratio")]
+impl_ratio_key!(i32, i64, u32, isize, usize);
+
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 const DEFAULT_LINEAR_MAX: usize = 8;
 const DEFAULT_BINARY_BELOW: usize = 2048;
 const RANGE_SCAN_MAX: usize = 8;
 
-/// 块内元素数超过它就建二级锚。
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 顺序访问游标（属于某个 [`JumpArray`] 实例）。
@@ -1288,6 +1330,41 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(feature = "ratio")]
+mod ratio_tests {
+    use super::*;
+    use fraction::Ratio;
+
+    /// 分数键：块号在 Ratio 上精确计算。
+    ///
+    /// `2^60` 处 f64 的分辨率是 256，`i/3` 这种差异会被全部量化掉；
+    /// 分数运算不会，所以块粒度应当保持。
+    #[test]
+    fn ratio_keys_keep_block_granularity() {
+        let base = Ratio::<i64>::from_integer(1 << 60);
+        let mut a = JumpArray::<Ratio<i64>, u8>::new();
+        for i in 0..3000i64 {
+            a.insert(base + Ratio::new(i, 3), 0).unwrap();
+        }
+        a.rebuild();
+        let (blocks, len, _) = a.stats();
+        assert_eq!(len, 3000);
+        assert!(blocks > 1500, "blocks={blocks}");
+        for i in (0..3000i64).step_by(7) {
+            let k = base + Ratio::new(i, 3);
+            assert_eq!(a.find_le(&k).map(|(x, _)| *x), Some(k), "le {i}");
+            assert_eq!(a.find_ge(&k).map(|(x, _)| *x), Some(k), "ge {i}");
+        }
+        let lo = base + Ratio::new(100, 3);
+        let hi = base + Ratio::new(163, 3);
+        let got: Vec<Ratio<i64>> = a.range(lo, hi).map(|(x, _)| *x).collect();
+        let want: Vec<Ratio<i64>> = (100..=163i64)
+            .map(|i| base + Ratio::new(i, 3))
+            .collect();
+        assert_eq!(got, want);
     }
 }
 

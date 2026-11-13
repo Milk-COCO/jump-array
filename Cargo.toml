@@ -3,8 +3,12 @@ name = "jump-array"
 version = "0.1.0"
 edition = "2024"
 
-# 独立库：不依赖 workspace 任何东西
+# 默认零依赖；`ratio` feature 打开分数键支持。
 [dependencies]
+fraction = { version = "^0.15", optional = true }
+
+[features]
+ratio = ["dep:fraction"]
 
 [[example]]
 name = "bench"
