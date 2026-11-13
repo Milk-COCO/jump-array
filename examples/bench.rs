@@ -11,7 +11,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use jump_array::{JumpArray, JumpArraySoA};
+use jump_array::JumpArray;
 
 /// 参与对比的两种实现。
 trait Store {
@@ -126,8 +126,11 @@ impl Store for Jump {
         Box::new(self.0.range(lo, hi))
     }
     fn mem_bytes(&self) -> usize {
-        let (blocks, len, _) = self.0.stats();
-        len * std::mem::size_of::<(i64, u32)>() + blocks * 4
+        let (blocks, minor, len, _) = self.0.stats();
+        len * (std::mem::size_of::<i64>() + std::mem::size_of::<u32>())
+            + blocks * 4
+            + blocks * 4
+            + minor * 4
     }
     fn window_sum(&self, key: &dyn Fn(usize) -> i64, wins: usize, n: usize, win: usize) -> i64 {
         let mut cur = self.0.cursor();
@@ -171,8 +174,11 @@ impl<const LM: usize> Store for JumpTuned<LM> {
         Box::new(self.0.range(lo, hi))
     }
     fn mem_bytes(&self) -> usize {
-        let (blocks, len, _) = self.0.stats();
-        len * std::mem::size_of::<(i64, u32)>() + blocks * 4
+        let (blocks, minor, len, _) = self.0.stats();
+        len * (std::mem::size_of::<i64>() + std::mem::size_of::<u32>())
+            + blocks * 4
+            + blocks * 4
+            + minor * 4
     }
     fn window_sum(&self, key: &dyn Fn(usize) -> i64, wins: usize, n: usize, win: usize) -> i64 {
         let mut cur = self.0.cursor();
@@ -203,11 +209,12 @@ impl<const LM: usize> Store for JumpTuned<LM> {
     }
 }
 
-struct JumpSoa(JumpArraySoA<i64, u32>);
+/// 打开二级锚的同一实现：用于 A/B "二级锚值不值"。
+struct JumpMinor(JumpArray<i64, u32>);
 
-impl Store for JumpSoa {
+impl Store for JumpMinor {
     fn new() -> Self {
-        Self(JumpArraySoA::new())
+        Self(JumpArray::new().with_minor_anchors(true))
     }
     fn insert(&mut self, k: i64, v: u32) -> Result<(), u32> {
         self.0.insert(k, v)
@@ -225,14 +232,54 @@ impl Store for JumpSoa {
         Box::new(self.0.range(lo, hi))
     }
     fn mem_bytes(&self) -> usize {
-        let (blocks, len, _) = self.0.stats();
-        len * (std::mem::size_of::<i64>() + std::mem::size_of::<u32>()) + blocks * 4
+        let (blocks, minor, len, _) = self.0.stats();
+        len * (std::mem::size_of::<i64>() + std::mem::size_of::<u32>())
+            + blocks * 4
+            + blocks * 4
+            + minor * 4
     }
     fn finalize(&mut self) {
         self.0.rebuild();
     }
     fn label() -> &'static str {
-        "jump-SoA"
+        "jump-minor"
+    }
+}
+
+/// 关掉二级锚的同一实现（= 默认配置）：用于 A/B。
+struct JumpNoMinor(JumpArray<i64, u32>);
+
+impl Store for JumpNoMinor {
+    fn new() -> Self {
+        Self(JumpArray::new().with_minor_anchors(false))
+    }
+    fn insert(&mut self, k: i64, v: u32) -> Result<(), u32> {
+        self.0.insert(k, v)
+    }
+    fn remove(&mut self, k: &i64) -> Option<u32> {
+        self.0.remove(k)
+    }
+    fn find_le(&self, k: &i64) -> Option<(&i64, &u32)> {
+        self.0.find_le(k)
+    }
+    fn iter_all<'a>(&'a self) -> Box<dyn Iterator<Item = (&'a i64, &'a u32)> + 'a> {
+        Box::new(self.0.iter())
+    }
+    fn range<'a>(&'a self, lo: i64, hi: i64) -> Box<dyn Iterator<Item = (&'a i64, &'a u32)> + 'a> {
+        Box::new(self.0.range(lo, hi))
+    }
+    fn mem_bytes(&self) -> usize {
+        let (blocks, minor, len, _) = self.0.stats();
+        len * (std::mem::size_of::<i64>() + std::mem::size_of::<u32>())
+            + blocks * 4
+            + blocks * 4
+            + minor * 4
+    }
+    fn finalize(&mut self) {
+        self.0.rebuild();
+    }
+    fn label() -> &'static str {
+        "jump-noMinor"
     }
 }
 
@@ -360,12 +407,17 @@ fn prep<S: Store, F: Fn(usize) -> i64 + Copy>(n: usize, key: F, win: usize) -> P
     }
 }
 
+/// 读指标：`(rand_ns, seq_ns, iter_ns, win_ns, wincur_ns)`。
+type Read5 = (f64, f64, f64, f64, f64);
+/// 编辑指标：`(build_ms, mem_mb, ins_ns, del_ns)`。
+type Edit4 = (f64, f64, f64, f64);
+
 /// 读指标成对测量：返回 `(A 的, B 的)`，各为 `(rand, seq, iter, win, wincur)`（ns）。
 fn paired_read<A: Store, B: Store, F: Fn(usize) -> i64 + Copy>(
     n: usize,
     key: F,
     win: usize,
-) -> ((f64, f64, f64, f64, f64), (f64, f64, f64, f64, f64)) {
+) -> (Read5, Read5) {
     let a = prep::<A, _>(n, key, win);
     let b = prep::<B, _>(n, key, win);
     let probes = a.qs.len() as f64;
@@ -523,7 +575,7 @@ fn time_remove_batch<S: Store>(s: &mut S, removes: &[i64]) -> (f64, f64) {
 fn paired_edit<A: Store, B: Store, F: Fn(usize) -> i64 + Copy>(
     n: usize,
     key: F,
-) -> ((f64, f64, f64, f64), (f64, f64, f64, f64)) {
+) -> (Edit4, Edit4) {
     let mut ba: Vec<(f64, f64)> = Vec::with_capacity(ROUNDS);
     let mut bb: Vec<(f64, f64)> = Vec::with_capacity(ROUNDS);
     let (mut mem_a, mut mem_b) = (0.0f64, 0.0f64);
@@ -634,10 +686,10 @@ fn print_pair<A: Store, B: Store, F: Fn(usize) -> i64 + Copy>(n: usize, key: F, 
     );
 }
 
-/// 只对比读指标：AoS(`Jump`) vs SoA(`JumpSoa`)，同轮交替。
+/// 只对比读指标：带二级锚 vs 不带（同一实现），同轮交替。
 fn print_pair_soa<F: Fn(usize) -> i64 + Copy>(n: usize, key: F, win: usize) {
-    let a = prep::<Jump, _>(n, key, win);
-    let b = prep::<JumpSoa, _>(n, key, win);
+    let a = prep::<JumpMinor, _>(n, key, win);
+    let b = prep::<JumpNoMinor, _>(n, key, win);
     let probes = a.qs.len() as f64;
     let wins = a.wins as f64;
 
@@ -730,14 +782,14 @@ fn print_pair_soa<F: Fn(usize) -> i64 + Copy>(n: usize, key: F, win: usize) {
         },
     );
     println!(
-        "  AoS   rand {:>6.1}ns seq {:>5.1}ns iter {:>5.2}ns/e win {:>6.1}ns",
+        "  minor  rand {:>6.1}ns seq {:>5.1}ns iter {:>5.2}ns/e win {:>6.1}ns",
         rand_a * 1e9 / probes,
         seq_a * 1e9 / n as f64,
         iter_a * 1e9 / n as f64,
         win_a * 1e9 / wins
     );
     println!(
-        "  SoA   rand {:>6.1}ns seq {:>5.1}ns iter {:>5.2}ns/e win {:>6.1}ns",
+        "  nomino rand {:>6.1}ns seq {:>5.1}ns iter {:>5.2}ns/e win {:>6.1}ns",
         rand_b * 1e9 / probes,
         seq_b * 1e9 / n as f64,
         iter_b * 1e9 / n as f64,
@@ -922,14 +974,16 @@ fn main() {
     let sparse = |i: usize| (i as i64) * 997;
     let clustered = |i: usize| ((i / 100) as i64) * 100_000 + (i % 100) as i64;
     if sweep_only {
-        // 只跑参数扫描：几秒级，用来找块宽/二分阈值的拐点。
+        // 只跑参数扫描：秒级，用来找二分阈值/二级锚的拐点。
         println!("# 参数扫描 n = {max_n}（窗口 {win}）");
-        println!("\n## 块宽倍数扫描");
-        width_scale_sweep(max_n, "稀疏均匀", sparse, win);
-        width_scale_sweep(max_n, "聚簇    ", clustered, win);
         println!("\n## 小数组二分阈值扫描");
         binary_below_sweep(max_n, "稀疏均匀", sparse, win);
         binary_below_sweep(max_n, "聚簇    ", clustered, win);
+        println!("\n## 二级锚 A/B");
+        println!("  稀疏均匀");
+        print_pair_soa(max_n, sparse, win);
+        println!("  聚簇    ");
+        print_pair_soa(max_n, clustered, win);
         return;
     }
     println!("# JumpArray vs Vec+二分（probe 过滤 + 中位数，窗口 {win} 元素）");
@@ -976,21 +1030,17 @@ fn main() {
     window_split(n, "稀疏均匀", sparse, win);
     window_split(n, "聚簇    ", clustered, win);
 
-    // ⑤ 块宽倍数扫描：块表更小（更可能进缓存）vs 块内扫更多。
-    println!("\n## 块宽倍数扫描 n = {n}（scale=1 是平均每块一个元素）");
-    width_scale_sweep(n, "稀疏均匀", sparse, win);
-    width_scale_sweep(n, "聚簇    ", clustered, win);
+    // ⑤ 二级锚：密集块再切 8 格（1 次加载 + 短扫）vs 块内二分。
+    println!("\n## 二级锚 A/B n = {n}（minor = 带锚，nomino = 不带）");
+    println!("  稀疏均匀");
+    print_pair_soa(n, sparse, win);
+    println!("  聚簇    ");
+    print_pair_soa(n, clustered, win);
 
     // ⑥ 小数组二分阈值：数组整体在 L1 时，二分能否打过块索引。
     println!("\n## 小数组二分阈值扫描 n = {n}（0=总用块索引）");
     binary_below_sweep(n, "稀疏均匀", sparse, win);
     binary_below_sweep(n, "聚簇    ", clustered, win);
-
-    // ⑦ AoS（键值同条）vs SoA（键值分数组）：只看读指标。
-    println!("\n## AoS vs SoA n = {n}  稀疏均匀");
-    print_pair_soa(n, sparse, win);
-    println!("## AoS vs SoA n = {n}  聚簇");
-    print_pair_soa(n, clustered, win);
 }
 
 /// 扫描"元素数 ≤ 阈值就用二分"的拐点。
@@ -1032,49 +1082,6 @@ fn binary_below_sweep(n: usize, label: &str, key: impl Fn(usize) -> i64 + Copy, 
             / wins as f64;
         println!(
             "  {label} binary_below {below:>6} | rand {rand:>6.1}ns | win-cur {wincur:>6.1}ns"
-        );
-    }
-}
-
-fn width_scale_sweep(n: usize, label: &str, key: impl Fn(usize) -> i64 + Copy, win: usize) {
-    let wins = (n / win).max(1);
-    let probes = 100_000usize.min(n.saturating_mul(10)).max(1_000);
-    let mut rng = Rng(0x1234_5678_9abc_def0);
-    let qs: Vec<i64> = (0..probes)
-        .map(|_| rng.below((n as u64) * 997 * 2) as i64)
-        .collect();
-    for scale in [0.5f64, 1.0, 2.0, 4.0, 8.0] {
-        let mut a = JumpArray::<i64, u32>::new().with_width_scale(scale);
-        for i in 0..n {
-            a.insert(key(i), i as u32).ok();
-        }
-        a.rebuild();
-        let (blocks, _, width) = a.stats();
-        let rand = bench(|| {
-            let mut acc = 0i64;
-            for q in &qs {
-                if let Some((k, _)) = a.find_le(q) {
-                    acc = acc.wrapping_add(*k);
-                }
-            }
-            black_box(acc);
-        }) * 1e9
-            / probes as f64;
-        let wincur = bench(|| {
-            let mut cur = a.cursor();
-            let mut acc = 0i64;
-            for w in 0..wins {
-                let lo = key(w * win);
-                let hi = key(((w + 1) * win).min(n - 1));
-                for (k, _) in a.range_from(&mut cur, lo, hi) {
-                    acc = acc.wrapping_add(*k);
-                }
-            }
-            black_box(acc);
-        }) * 1e9
-            / wins as f64;
-        println!(
-            "  {label} scale {scale:>4} blocks {blocks:>7} W {width:>12.0} | rand {rand:>6.1}ns | win-cur {wincur:>6.1}ns"
         );
     }
 }
