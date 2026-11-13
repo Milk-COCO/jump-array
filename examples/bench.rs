@@ -459,68 +459,120 @@ fn paired_read<A: Store, B: Store, F: Fn(usize) -> i64 + Copy>(
     )
 }
 
-/// 建表/编辑指标（单档，构建在计时之外）。
-fn edit_metrics<S: Store, F: Fn(usize) -> i64 + Copy>(
+fn build_store<S: Store, F: Fn(usize) -> i64 + Copy>(n: usize, key: F) -> S {
+    let mut s = S::new();
+    for i in 0..n {
+        s.insert(key(i), i as u32).ok();
+    }
+    s.finalize();
+    s
+}
+
+fn time_insert_batch<S: Store>(s: &mut S, inserts: &[i64]) -> (f64, f64) {
+    let p = cpu_probe_ms();
+    let t = Instant::now();
+    for (j, k) in inserts.iter().enumerate() {
+        s.insert(*k, j as u32).ok();
+    }
+    (p, t.elapsed().as_secs_f64())
+}
+
+fn time_remove_batch<S: Store>(s: &mut S, removes: &[i64]) -> (f64, f64) {
+    let p = cpu_probe_ms();
+    let t = Instant::now();
+    for k in removes {
+        s.remove(k);
+    }
+    (p, t.elapsed().as_secs_f64())
+}
+
+/// 建表/编辑指标成对测量：`(A 的, B 的)`，各为 `(build_ms, mem_mb, ins_ns, del_ns)`。
+fn paired_edit<A: Store, B: Store, F: Fn(usize) -> i64 + Copy>(
     n: usize,
     key: F,
-) -> (f64, f64, f64, f64) {
-    let mut mem_mb = 0.0;
-    let build_ms = bench(|| {
-        let mut s = S::new();
-        for i in 0..n {
-            s.insert(key(i), i as u32).ok();
+) -> ((f64, f64, f64, f64), (f64, f64, f64, f64)) {
+    let mut ba: Vec<(f64, f64)> = Vec::with_capacity(ROUNDS);
+    let mut bb: Vec<(f64, f64)> = Vec::with_capacity(ROUNDS);
+    let (mut mem_a, mut mem_b) = (0.0f64, 0.0f64);
+    for r in 0..ROUNDS {
+        if r % 2 == 0 {
+            let p = cpu_probe_ms();
+            let t = Instant::now();
+            let s = build_store::<A, _>(n, key);
+            ba.push((p, t.elapsed().as_secs_f64()));
+            mem_a = black_box(s.mem_bytes()) as f64 / 1e6;
+            let p = cpu_probe_ms();
+            let t = Instant::now();
+            let s = build_store::<B, _>(n, key);
+            bb.push((p, t.elapsed().as_secs_f64()));
+            mem_b = black_box(s.mem_bytes()) as f64 / 1e6;
+        } else {
+            let p = cpu_probe_ms();
+            let t = Instant::now();
+            let s = build_store::<B, _>(n, key);
+            bb.push((p, t.elapsed().as_secs_f64()));
+            mem_b = black_box(s.mem_bytes()) as f64 / 1e6;
+            let p = cpu_probe_ms();
+            let t = Instant::now();
+            let s = build_store::<A, _>(n, key);
+            ba.push((p, t.elapsed().as_secs_f64()));
+            mem_a = black_box(s.mem_bytes()) as f64 / 1e6;
         }
-        s.finalize();
-        mem_mb = s.mem_bytes() as f64 / 1e6;
-        black_box(s.mem_bytes());
-    }) * 1e3;
+    }
+    let build_a = median_filtered(&ba) * 1e3;
+    let build_b = median_filtered(&bb) * 1e3;
 
     let add = (n / 10).clamp(100, 2000);
     let mut rng = Rng(0xdead_beef_1234_5678);
     let inserts: Vec<i64> = (0..add)
         .map(|_| (rng.below((n as u64) * 997 * 2)) as i64)
         .collect();
-    let mut best_ins = f64::MAX;
-    for _ in 0..ROUNDS {
-        let mut s = S::new();
-        for i in 0..n {
-            s.insert(key(i), i as u32).ok();
+
+    let mut ia: Vec<(f64, f64)> = Vec::with_capacity(ROUNDS);
+    let mut ib: Vec<(f64, f64)> = Vec::with_capacity(ROUNDS);
+    for r in 0..ROUNDS {
+        let mut sa = build_store::<A, _>(n, key);
+        let mut sb = build_store::<B, _>(n, key);
+        if r % 2 == 0 {
+            ia.push(time_insert_batch(&mut sa, &inserts));
+            ib.push(time_insert_batch(&mut sb, &inserts));
+        } else {
+            ib.push(time_insert_batch(&mut sb, &inserts));
+            ia.push(time_insert_batch(&mut sa, &inserts));
         }
-        s.finalize();
-        let t = Instant::now();
-        for (j, k) in inserts.iter().enumerate() {
-            s.insert(*k, j as u32).ok();
-        }
-        black_box(s.mem_bytes());
-        best_ins = best_ins.min(t.elapsed().as_secs_f64());
     }
+    let ins_a = median_filtered(&ia) * 1e9 / add as f64;
+    let ins_b = median_filtered(&ib) * 1e9 / add as f64;
+
     let removes = inserts.clone();
-    let mut best_del = f64::MAX;
-    for _ in 0..ROUNDS {
-        let mut s = S::new();
-        for i in 0..n {
-            s.insert(key(i), i as u32).ok();
+    let mut da: Vec<(f64, f64)> = Vec::with_capacity(ROUNDS);
+    let mut db: Vec<(f64, f64)> = Vec::with_capacity(ROUNDS);
+    for r in 0..ROUNDS {
+        let mut sa = build_store::<A, _>(n, key);
+        let mut sb = build_store::<B, _>(n, key);
+        if r % 2 == 0 {
+            da.push(time_remove_batch(&mut sa, &removes));
+            db.push(time_remove_batch(&mut sb, &removes));
+        } else {
+            db.push(time_remove_batch(&mut sb, &removes));
+            da.push(time_remove_batch(&mut sa, &removes));
         }
-        let t = Instant::now();
-        for k in &removes {
-            s.remove(k);
-        }
-        black_box(s.mem_bytes());
-        best_del = best_del.min(t.elapsed().as_secs_f64());
     }
+    let del_a = median_filtered(&da) * 1e9 / removes.len() as f64;
+    let del_b = median_filtered(&db) * 1e9 / removes.len() as f64;
+
     (
-        build_ms,
-        mem_mb,
-        best_ins * 1e9 / add as f64,
-        best_del * 1e9 / removes.len() as f64,
+        (build_a, mem_a, ins_a, del_a),
+        (build_b, mem_b, ins_b, del_b),
     )
 }
 
 /// 成对打印两档（同轮交替测量）。
 fn print_pair<A: Store, B: Store, F: Fn(usize) -> i64 + Copy>(n: usize, key: F, win: usize) {
     let (ra, rb) = paired_read::<A, B, _>(n, key, win);
-    let (build_a, mem_a, ins_a, del_a) = edit_metrics::<A, _>(n, key);
-    let (build_b, mem_b, ins_b, del_b) = edit_metrics::<B, _>(n, key);
+    let (ea, eb) = paired_edit::<A, B, _>(n, key);
+    let (build_a, mem_a, ins_a, del_a) = ea;
+    let (build_b, mem_b, ins_b, del_b) = eb;
     println!(
         "  {:<10} build {:>8.2}ms | mem {:>5.2}MB | find_le rand {:>6.1}ns seq {:>5.1}ns | iter {:>5.2}ns/e | win {:>6.1}ns | win-cur {:>6.1}ns | ins {:>9.1}ns | del {:>9.1}ns",
         A::label(),
